@@ -10,6 +10,18 @@ requires-python = "==3.10.*"
 readme = "README.md"
 license = {text = "MIT"}
 
+[project.optional-dependencies]
+mcp = [
+    "mcp[cli]>=1.8.0",
+    "fastapi>=0.115.12",
+    "pendulum>=3.1.0",
+]
+dev = [
+    "ipython>=8.36.0",
+]
 
 [tool.pdm]
 distribution = false
+
+[tool.pdm.scripts]
+start = "python -m src.roamresearch_client_py.mcp"
