@@ -1,4 +1,4 @@
-from typing import cast, Optional
+from typing import cast, Optional, Union
 import json
 import uuid
 import os
@@ -54,7 +54,13 @@ def remove_block(uid):
 
 
 class Block:
-    def __init__(self, client: "RoamClient", text: str, parent_uid=None, open=True):
+    def __init__(
+            self,
+            text: str,
+            parent_uid=None,
+            open=True,
+            client: Union["RoamClient", None] = None
+    ):
         self.client = client
         self.actions = []
         # Create the root block.
@@ -64,6 +70,21 @@ class Block:
         self.current_parent_uid = parent_uid
         self.current_uid = uid
         self.parent_uid_stack = []
+
+    def set_client(self, client: "RoamClient"):
+        self.client = client
+
+    def text(self, text: str):
+        for i in self.actions:
+            if i['block']['uid'] == self.current_uid:
+                i['block']['string'] = text
+                break
+
+    def append_text(self, text: str):
+        for i in self.actions:
+            if i['block']['uid'] == self.current_uid:
+                i['block']['string'] += text
+                break
 
     def write(self, text: str):
         uid = uuid.uuid4().hex
@@ -84,6 +105,7 @@ class Block:
         return [i for i in self.actions]
 
     async def save(self):
+        assert self.client is not None, "Client not initialized"
         await self.client.batch_actions(self.actions)
   
     async def __aenter__(self):
@@ -93,8 +115,11 @@ class Block:
         if self.actions:
             await self.save()
 
+    def __str__(self):
+        return json.dumps(self.actions)
 
-class RoamClient:
+
+class RoamClient(object):
     def __init__(self, api_token: str | None = None, graph: str | None = None):
         if api_token is None:
             api_token = os.getenv("ROAM_API_TOKEN")
@@ -172,8 +197,23 @@ class RoamClient:
             raise Exception('Daily page not found.')
         return resp.get('result')[0][0]
 
+    async def get_block_recursively(self, uid: str):
+        query = f"""
+[:find (pull ?e [*
+                 {{:block/children [*]}}
+                 {{:block/refs [*]}}
+                ])
+ :where
+    [?pid :block/uid "{uid}"]
+    [?e :block/parents ?id]
+    [?e :block/parents ?pid]
+]
+        """
+        resp = await self.q(query)
+        return resp
+
     def create_block(self, text: str, parent_uid: str | None = None, open: bool = True):
         if parent_uid is None:
             now = pendulum.now()
             parent_uid = f"{now.month:02d}-{now.day:02d}-{now.year}"
-        return Block(self, text, parent_uid, open)
+        return Block(text, parent_uid, open, client=self)
