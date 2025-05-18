@@ -27,11 +27,14 @@ def ast_to_inline(ast: dict):
                 return f"[{ast['raw']}]({ast['attrs']['url']})"
             return ast['raw']
         case 'codespan':
-            return f'`{ast["raw"]}`'
+            text = "".join([ast_to_inline(i) for i in ast["children"]])
+            return f'`{text}`'
         case "strong":
-            return f"**{ast['children'][0]['raw']}**"
+            text = "".join([ast_to_inline(i) for i in ast["children"]])
+            return f"**{text}**"
         case "emphasis":
-            return f"*{ast['children'][0]['raw']}*"
+            text = "".join([ast_to_inline(i) for i in ast["children"]])
+            return f"*{text}*"
         case "link":
             return ast_to_inline(ast['children'][0])
     logger.warn(f'unsupported inline type: {ast["type"]}')
@@ -46,7 +49,7 @@ def ast_to_block(
     match ast['type']:
         case 'heading':
             assert len(ast['children']) == 1
-            level = ast['attrs']['level'] - 1
+            level = ast['attrs']['level']
             items = [ast_to_inline(i) for i in ast['children']]
             blk = create_block(''.join(items), pid, gen_uid())
             if level <= 3:
@@ -63,12 +66,8 @@ def ast_to_block(
                 return list(chain(*nested))
 
         case 'list_item':
-            cur = None
-            if ast['children'][0]['type'] == 'block_text':
-                ret = ast_to_block(ast['children'][0], uid=uid, pid=pid)
-                cur = ret[0]
-            else:
-                cur = create_block("", parent_uid=pid, uid=uid)
+            ret = ast_to_block(ast['children'][0], uid=uid, pid=pid)
+            cur = ret[0]
             nested = [ast_to_block(i, pid=cur['block']['uid']) for i in ast['children'][1:]]
             # return ast_to_block(ast['children'][0], block_obj)
             return [cur] + list(chain(*nested))
@@ -82,7 +81,8 @@ def ast_to_block(
             return [create_block("".join(items), pid, gen_uid())]
 
         case 'blank_line':
-            return [create_block("", pid, gen_uid())]
+            # return [create_block("", pid, gen_uid())]
+            return []
 
     logger.warn(f"unsupported block type: {ast['type']}")
 

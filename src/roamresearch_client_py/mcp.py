@@ -6,6 +6,7 @@ import signal
 import os
 import asyncio
 import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
 import mcp.types as types
@@ -16,6 +17,9 @@ import pendulum
 from .RoamClient import RoamClient, create_page, create_block
 from .formatter import format_block
 from .gfm_to_roam import gfm_to_batch_actions
+
+
+project_root = Path(__file__).parent.parent.parent
 
 
 class CancelledErrorFilter(logging.Filter):
@@ -42,7 +46,6 @@ def get_when(when = None):
 
 
 async def get_topic_uid(client, topic: str, when: pendulum.DateTime):
-    print('get_topic_uid', topic, when)
     block = await client.q(f"""
         [:find (pull ?id [:block/uid :node/title :block/string])
          :where [?id :block/string "{topic}"]
@@ -50,7 +53,6 @@ async def get_topic_uid(client, topic: str, when: pendulum.DateTime):
                 [?pid :block/uid "{when.format('MM-DD-YYYY')}"]
         ]
     """)
-    print(block)
     if not block or not block['result']:
         raise ValueError(f"Topic node {topic} not found for {when.format('MM-DD-YYYY')}")
     return block['result'][0][0][':block/uid']
@@ -68,25 +70,32 @@ async def get_topic_uid(client, topic: str, when: pendulum.DateTime):
     """
 )
 async def save_markdown(title: str, markdown: str) -> str:
-    async with RoamClient() as client:
-        page = create_page(title)
-        actions = gfm_to_batch_actions(markdown, page['page']['uid'])
-        actions = [page] + actions
-        when = get_when()
-        topic_node = os.getenv("TOPIC_NODE")
-        print('topic_node', topic_node)
-        if topic_node:
-            topic_uid = await get_topic_uid(client, topic_node, when)
-            actions.append(create_block(f"[[{title}]]", topic_uid, uuid.uuid4().hex))
-        else:
-            actions.append(create_block(f"[[{title}]]", when.format('MM-DD-YYYY'), uuid.uuid4().hex))
-        await client.batch_actions(actions)
-    return f"Saved"
+    page_uid = uuid.uuid4().hex
+    try:
+        async with RoamClient() as client:
+            page = create_page(title)
+            actions = gfm_to_batch_actions(markdown, page['page']['uid'])
+            actions = [page] + actions
+            when = get_when()
+            topic_node = os.getenv("TOPIC_NODE")
+            if topic_node:
+                topic_uid = await get_topic_uid(client, topic_node, when)
+                actions.append(create_block(f"[[{title}]]", topic_uid, page_uid))
+            else:
+                actions.append(create_block(f"[[{title}]]", when.format('MM-DD-YYYY'), page_uid))
+            await client.batch_actions(actions)
+        return f"Saved"
+    except Exception as e:
+        msg = f"Error: {e}"
+        if type(e) == httpx.HTTPStatusError:
+            msg = f"Error: {e.response.text}\n\n{e.response.status_code}"
+        with open(f'{project_root}/storage/{page_uid}.txt', 'w') as f:
+            f.write(f"{title}\n\n{markdown}\n\n{msg}")
+        return msg
 
 
 @mcp.tool(name="query", description="Query your Roam Research data with datalog, query MUST be a valid datalog query")
 async def handle_query_roam(q: str) -> str:
-    print(q)
     async with RoamClient() as client:
         try:
             result = await client.q(q)
