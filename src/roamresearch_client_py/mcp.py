@@ -5,6 +5,7 @@ import logging
 import signal
 import os
 import asyncio
+import uuid
 
 from dotenv import load_dotenv
 import mcp.types as types
@@ -12,7 +13,7 @@ from mcp.server.fastmcp import FastMCP
 import httpx
 import pendulum
 
-from .RoamClient import RoamClient, create_page
+from .RoamClient import RoamClient, create_page, create_block
 from .formatter import format_block
 from .gfm_to_roam import gfm_to_batch_actions
 
@@ -29,19 +30,57 @@ mcp = FastMCP(name="RoamResearch", stateless_http=True)
 logger = logging.getLogger(__name__)
 
 
+def get_when(when = None):
+    if not when:
+        date_obj = pendulum.now()
+    else:
+        try:
+            date_obj = cast(pendulum.DateTime, pendulum.parse(when.strip()))
+        except Exception as e:
+            raise ValueError(f"Unrecognized date format: {when}")
+    return date_obj
+
+
+async def get_topic_uid(client, topic: str, when: pendulum.DateTime):
+    print('get_topic_uid', topic, when)
+    block = await client.q(f"""
+        [:find (pull ?id [:block/uid :node/title :block/string])
+         :where [?id :block/string "{topic}"]
+                [?id :block/parents ?pid]
+                [?pid :block/uid "{when.format('MM-DD-YYYY')}"]
+        ]
+    """)
+    print(block)
+    if not block or not block['result']:
+        raise ValueError(f"Topic node {topic} not found for {when.format('MM-DD-YYYY')}")
+    return block['result'][0][0][':block/uid']
+
+#
+#
+#
+
+
 @mcp.tool(
     description="""Save a markdown doc into Roam Research's Daily Notes.
 
-    - title should be plaintext of the document title.
-    - markdown should be GitHub Flavored Markdown (GFM) format.
+    - title: should be plaintext of the document title.
+    - markdown: should be GitHub Flavored Markdown (GFM) format. Do not include title as H1 in markdown.
     """
 )
 async def save_markdown(title: str, markdown: str) -> str:
     async with RoamClient() as client:
         page = create_page(title)
         actions = gfm_to_batch_actions(markdown, page['page']['uid'])
-        await client.batch_actions([page] + actions)
-        await client.write(f"[[{title}]]")
+        actions = [page] + actions
+        when = get_when()
+        topic_node = os.getenv("TOPIC_NODE")
+        print('topic_node', topic_node)
+        if topic_node:
+            topic_uid = await get_topic_uid(client, topic_node, when)
+            actions.append(create_block(f"[[{title}]]", topic_uid, uuid.uuid4().hex))
+        else:
+            actions.append(create_block(f"[[{title}]]", when.format('MM-DD-YYYY'), uuid.uuid4().hex))
+        await client.batch_actions(actions)
     return f"Saved"
 
 
@@ -125,6 +164,11 @@ async def get_journaling_by_date(when=None):
     if not blocks:
         return ''
     return "\n\n".join(blocks).strip()
+
+
+#
+#
+#
 
 
 async def serve():

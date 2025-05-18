@@ -23,10 +23,19 @@ def gen_uid():
 def ast_to_inline(ast: dict):
     match ast['type']:
         case 'text':
+            if ast.get('attrs', {}).get('url'):
+                return f"[{ast['raw']}]({ast['attrs']['url']})"
             return ast['raw']
         case 'codespan':
             return f'`{ast["raw"]}`'
-    raise NotImplemented(f'unsupported inline type: {ast["type"]}')
+        case "strong":
+            return f"**{ast['children'][0]['raw']}**"
+        case "emphasis":
+            return f"*{ast['children'][0]['raw']}*"
+        case "link":
+            return ast_to_inline(ast['children'][0])
+    logger.warn(f'unsupported inline type: {ast["type"]}')
+    return ""
 
 
 def ast_to_block(
@@ -65,6 +74,10 @@ def ast_to_block(
             return [cur] + list(chain(*nested))
 
         case 'block_text':
+            items = [ast_to_inline(i) for i in ast['children']]
+            return [create_block("".join(items), pid, gen_uid())]
+
+        case 'paragraph':
             items = [ast_to_inline(i) for i in ast['children']]
             return [create_block("".join(items), pid, gen_uid())]
 
