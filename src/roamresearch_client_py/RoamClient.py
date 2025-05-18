@@ -9,14 +9,24 @@ import pendulum
 def create_page(title, uid=None, childrenViewType=None):
     if childrenViewType is None:
         childrenViewType = "bullet"
-    return {
-        "action": "create-page",
-        "page": {
-            "title": title,
-            "uid": uid,
-            "children-view-type": childrenViewType,
-        },
-    }
+    if uid:
+        return {
+            "action": "create-page",
+            "page": {
+                "title": title,
+                "uid": uid,
+                "children-view-type": childrenViewType,
+            },
+        }
+    else:
+        return {
+            "action": "create-page",
+            "page": {
+                "title": title,
+                "uid": uuid.uuid4().hex,
+                "children-view-type": childrenViewType,
+            },
+        }
 
 
 def create_block(text, parent_uid, uid=None, order="last", open=True):

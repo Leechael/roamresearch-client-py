@@ -76,10 +76,10 @@ def ast_to_block(
     return []
 
 
-def gfm_to_blocks(raw: str, pid):
-    root = Block("", parent_uid=pid)
+def gfm_to_batch_actions(raw: str, pid):
+    actions = []
     for blk in parse(raw):
-        lst = ast_to_block(cast(dict, blk), pid=root.current_uid)
+        lst = ast_to_block(cast(dict, blk), pid=pid)
         if lst:
-            root.actions.extend(lst)
-    return root
+            actions.extend(lst)
+    return actions

@@ -12,8 +12,9 @@ from mcp.server.fastmcp import FastMCP
 import httpx
 import pendulum
 
-from .RoamClient import RoamClient
+from .RoamClient import RoamClient, create_page
 from .formatter import format_block
+from .gfm_to_roam import gfm_to_batch_actions
 
 
 class CancelledErrorFilter(logging.Filter):
@@ -28,10 +29,19 @@ mcp = FastMCP(name="RoamResearch", stateless_http=True)
 logger = logging.getLogger(__name__)
 
 
-@mcp.tool(description="Save a text block into Roam Research's Daily Notes")
-async def save_block(message: str) -> str:
+@mcp.tool(
+    description="""Save a markdown doc into Roam Research's Daily Notes.
+
+    - title should be plaintext of the document title.
+    - markdown should be GitHub Flavored Markdown (GFM) format.
+    """
+)
+async def save_markdown(title: str, markdown: str) -> str:
     async with RoamClient() as client:
-        await client.write(message)
+        page = create_page(title)
+        actions = gfm_to_batch_actions(markdown, page['page']['uid'])
+        await client.batch_actions([page] + actions)
+        await client.write(f"[[{title}]]")
     return f"Saved"
 
 
