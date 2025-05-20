@@ -7,6 +7,7 @@ import os
 import asyncio
 import uuid
 from pathlib import Path
+import traceback
 
 from dotenv import load_dotenv
 import mcp.types as types
@@ -74,23 +75,28 @@ async def save_markdown(title: str, markdown: str) -> str:
     try:
         async with RoamClient() as client:
             page = create_page(title)
+            logger.info(f"Page: {page}")
             actions = gfm_to_batch_actions(markdown, page['page']['uid'])
+            logger.info(f"Actions size: {len(actions)}")
             actions = [page] + actions
             when = get_when()
             topic_node = os.getenv("TOPIC_NODE")
             if topic_node:
                 topic_uid = await get_topic_uid(client, topic_node, when)
+                logger.info(f"Topic UID: {topic_uid}")
                 actions.append(create_block(f"[[{title}]]", topic_uid, page_uid))
             else:
                 actions.append(create_block(f"[[{title}]]", when.format('MM-DD-YYYY'), page_uid))
             await client.batch_actions(actions)
         return f"Saved"
     except Exception as e:
+        logger.error(f"Error: {e}\n{traceback.format_exc()}")
         msg = f"Error: {e}"
         if type(e) == httpx.HTTPStatusError:
             msg = f"Error: {e.response.text}\n\n{e.response.status_code}"
         with open(f'{project_root}/storage/{page_uid}.txt', 'w') as f:
             f.write(f"{title}\n\n{markdown}\n\n{msg}")
+        logger.info(f"Save debug file: {project_root}/storage/{page_uid}.txt")
         return msg
 
 

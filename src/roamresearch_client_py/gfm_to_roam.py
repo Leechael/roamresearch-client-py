@@ -27,14 +27,23 @@ def ast_to_inline(ast: dict):
                 return f"[{ast['raw']}]({ast['attrs']['url']})"
             return ast['raw']
         case 'codespan':
-            text = "".join([ast_to_inline(i) for i in ast["children"]])
-            return f'`{text}`'
+            if "children" in ast:
+                text = "".join([ast_to_inline(i) for i in ast["children"]])
+                return f'`{text}`'
+            else:
+                return f'`{ast["raw"]}`'
         case "strong":
-            text = "".join([ast_to_inline(i) for i in ast["children"]])
-            return f"**{text}**"
+            if "children" in ast:
+                text = "".join([ast_to_inline(i) for i in ast["children"]])
+                return f"**{text}**"
+            else:
+                return f"**{ast['raw']}**"
         case "emphasis":
-            text = "".join([ast_to_inline(i) for i in ast["children"]])
-            return f"*{text}*"
+            if "children" in ast:
+                text = "".join([ast_to_inline(i) for i in ast["children"]])
+                return f"*{text}*"
+            else:
+                return f"*{ast['raw']}*"
         case "link":
             return ast_to_inline(ast['children'][0])
     logger.warn(f'unsupported inline type: {ast["type"]}')
