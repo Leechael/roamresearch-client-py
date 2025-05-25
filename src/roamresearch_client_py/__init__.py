@@ -1,4 +1,4 @@
-from .RoamClient import RoamClient
+from .client import RoamClient
 
 __all__ = ["RoamClient"]
 __version__ = "0.1.0"

@@ -15,7 +15,7 @@ from mcp.server.fastmcp import FastMCP
 import httpx
 import pendulum
 
-from .RoamClient import RoamClient, create_page, create_block
+from .client import RoamClient, create_page, create_block
 from .formatter import format_block
 from .gfm_to_roam import gfm_to_batch_actions
 

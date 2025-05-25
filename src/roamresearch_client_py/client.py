@@ -6,6 +6,7 @@ import os
 import httpx
 import pendulum
 
+
 def create_page(title, uid=None, childrenViewType=None):
     if childrenViewType is None:
         childrenViewType = "bullet"

@@ -5,9 +5,10 @@ import logging
 
 import mistune
 
-from .RoamClient import create_block, Block
+from .client import create_block
+from .structs import Block, BlockRef
 
-parse = mistune.create_markdown(renderer=None)
+parse = mistune.create_markdown(renderer=None, plugins=['table'])
 logger = logging.getLogger(__name__)
 
 
@@ -52,56 +53,97 @@ def ast_to_inline(ast: dict):
 
 def ast_to_block(
         ast: dict,
-        uid: Union[str, None] = None,
-        pid: Union[str, None] = None
-    ):
+        parent_ref: BlockRef,
+    ) -> list[Block]:
     match ast['type']:
+        # NOTE: RoamResearch only supports heading up to level 3
         case 'heading':
-            assert len(ast['children']) == 1
-            level = ast['attrs']['level']
             items = [ast_to_inline(i) for i in ast['children']]
-            blk = create_block(''.join(items), pid, gen_uid())
-            if level <= 3:
-                blk['block']['heading'] = level
+            blk = Block(''.join(items), parent_ref)
+            blk.heading = ast['attrs']['level']
             return [blk]
 
         case 'list':
-            if not pid:
-                blk = create_block("", None, gen_uid())
-                nested = [ast_to_block(i, pid=blk['block']['uid']) for i in ast['children']]
-                return [blk] + list(chain(*nested))
-            else:
-                nested = [ast_to_block(i, pid=pid) for i in ast['children']]
-                return list(chain(*nested))
+            nested = [ast_to_block(i, parent_ref) for i in ast['children']]
+            return list(chain(*nested))
+            # if not pid:
+            #     blk = create_block("", None, gen_uid())
+            #     nested = [ast_to_block(i, pid=blk['block']['uid']) for i in ast['children']]
+            #     return [blk] + list(chain(*nested))
+            # else:
+            #     nested = [ast_to_block(i, pid=pid) for i in ast['children']]
+            #     return list(chain(*nested))
 
         case 'list_item':
-            ret = ast_to_block(ast['children'][0], uid=uid, pid=pid)
-            cur = ret[0]
-            nested = [ast_to_block(i, pid=cur['block']['uid']) for i in ast['children'][1:]]
-            # return ast_to_block(ast['children'][0], block_obj)
+            cur, = ast_to_block(ast['children'][0], parent_ref)
+            nested = [ast_to_block(i, cur.ref) for i in ast['children'][1:]]
             return [cur] + list(chain(*nested))
 
         case 'block_text':
             items = [ast_to_inline(i) for i in ast['children']]
-            return [create_block("".join(items), pid, gen_uid())]
+            return [Block("".join(items), parent_ref)]
 
         case 'paragraph':
             items = [ast_to_inline(i) for i in ast['children']]
-            return [create_block("".join(items), pid, gen_uid())]
+            return [Block("".join(items), parent_ref)]
 
         case 'blank_line':
             # return [create_block("", pid, gen_uid())]
             return []
+        
+        case 'table':
+            # Typical table structure from mistune AST will contains two children: table_head and table_body
+            table_block = Block(text="{{[[table]]}}", parent_ref=parent_ref, open=False)
+            lst = [table_block]
+            for i in ast["children"]:
+                children = ast_to_block(i, table_block.ref)
+                lst.extend(children)
+            return lst
+
+        case 'table_head':
+            lst = []
+            ref = parent_ref
+            for i in ast['children']:
+                child, = ast_to_block(i, ref)
+                lst.append(child)
+                ref = child.ref
+            return lst
+
+        case 'table_body':
+            lst = []
+            for i in ast['children']:
+                cells = ast_to_block(i, parent_ref)
+                lst.extend(cells)
+            return lst
+        
+        case 'table_row':
+            lst = []
+            ref = parent_ref
+            for i in ast['children']:
+                cell, = ast_to_block(i, ref)
+                lst.append(cell)
+                ref = cell.ref
+            return lst
+
+        case 'table_cell':
+            items = [ast_to_inline(i) for i in ast['children']]
+            return [Block("".join(items), parent_ref)]
 
     logger.warn(f"unsupported block type: {ast['type']}")
 
     return []
 
 
-def gfm_to_batch_actions(raw: str, pid):
-    actions = []
+def gfm_to_blocks(raw: str, pid: str):
+    blocks = []
+    ref = BlockRef(block_uid=pid)
     for blk in parse(raw):
-        lst = ast_to_block(cast(dict, blk), pid=pid)
+        lst = ast_to_block(cast(dict, blk), ref)
         if lst:
-            actions.extend(lst)
-    return actions
+            blocks.extend(lst)
+    return blocks
+
+
+def gfm_to_batch_actions(raw: str, pid: str):
+    blocks = gfm_to_blocks(raw, pid)
+    return [b.to_create_action() for b in blocks]
