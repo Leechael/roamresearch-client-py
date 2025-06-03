@@ -47,9 +47,10 @@ def ast_to_inline(ast: dict):
                 return f"*{ast['raw']}*"
         case "link":
             return ast_to_inline(ast['children'][0])
+        case 'softbreak':
+            return "\n"
     logger.warn(f'unsupported inline type: {ast["type"]}')
     return ""
-
 
 def ast_to_block(
         ast: dict,
@@ -128,6 +129,11 @@ def ast_to_block(
         case 'table_cell':
             items = [ast_to_inline(i) for i in ast['children']]
             return [Block("".join(items), parent_ref)]
+    
+        case 'block_code':
+            lang = ast.get('attrs', {}).get('info', '')
+            code = ast.get('raw', '')
+            return [Block(f"```{lang}\n{code}\n```", parent_ref)]
 
     logger.warn(f"unsupported block type: {ast['type']}")
 
