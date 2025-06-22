@@ -236,6 +236,16 @@ class RoamClient(object):
         resp = await self.q(query)
         return resp
 
+    async def get_block_by_db_id(self, db_id: int):
+        query = f"""
+[:find (pull ?e [*])
+ :where
+ [?e _ _]
+ [(= ?e {db_id})]]
+        """
+        resp = await self.q(query)
+        return resp
+
     def create_block(self, text: str, parent_uid: str | None = None, open: bool = True):
         if parent_uid is None:
             now = pendulum.now()
