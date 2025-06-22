@@ -7,6 +7,10 @@ import httpx
 import pendulum
 
 
+class RoamRequestError(ValueError):
+    pass
+
+
 def create_page(title, uid=None, childrenViewType=None):
     if childrenViewType is None:
         childrenViewType = "bullet"
@@ -171,15 +175,24 @@ class RoamClient(object):
     async def _request(self, path, data, parse_response=True):
         assert self._client is not None, "Client not initialized"
         resp = await self._client.post(path, data=json.dumps(data))  # type: ignore
+        if resp.status_code == 500 or resp.status_code == 400:
+            # NOTE: not sure is it always return JSON.
+            payload = resp.json()
+            if "message" in payload:
+                raise RoamRequestError(payload["message"])
+            else:
+                raise RoamRequestError(resp.text)
         resp.raise_for_status()
         if parse_response:
             return resp.json()
 
     async def q(self, query: str, args: Optional[list[str]] = None):
-        return await self._request("/q", {
+        resp = await self._request("/q", {
             "query": query,
             "args": args or [],
         })
+        assert resp is not None
+        return resp['result']
 
     async def batch_actions(self, actions: list[dict]):
         return await self._request("/write", {
