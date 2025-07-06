@@ -138,6 +138,17 @@ def ast_to_block(
             code = ast.get('raw', '')
             return [Block(f"```{lang}\n{code}\n```", parent_ref)]
 
+        case 'thematic_break':
+            return [Block("---", parent_ref)]
+
+        case 'block_quote':
+            if len(ast.get("children", [])) > 1 or ast["children"][0].get("type") != 'paragraph':
+                logger.warn(f"Unexpected AST for block type block_quote: {ast}")
+                return []
+            blk, = ast_to_block(ast["children"][0], parent_ref)
+            blk.text = f"> {blk.text}"
+            return [blk]
+
     logger.warn(f"unsupported block type: {ast['type']}")
 
     return []
