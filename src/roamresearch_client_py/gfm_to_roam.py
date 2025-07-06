@@ -1,4 +1,4 @@
-from typing import cast, Union
+from typing import cast, List, Dict, Any, Literal
 from itertools import chain
 import uuid
 import logging
@@ -63,6 +63,7 @@ def ast_to_inline(ast: dict) -> str:
 def ast_to_block(
         ast: dict,
         parent_ref: BlockRef,
+        prefix: str | None = None
     ) -> list[Block]:
     match ast['type']:
         # NOTE: RoamResearch only supports heading up to level 3
@@ -75,13 +76,18 @@ def ast_to_block(
         case 'list':
             nested = [ast_to_block(i, parent_ref) for i in ast['children']]
             lst = []
-            for i in ast['children']:
-                blks = ast_to_block(i, parent_ref)
+            list_type = ast.get('attrs', {}).get('ordered') and 'ordered' or 'numeric'
+            for idx, i in enumerate(ast['children']):
+                prefix = ''
+                if list_type == 'numeric':
+                    prefix = f'{idx+1}. '
+                blks = ast_to_block(i, parent_ref, prefix)
                 lst.extend(blks)
             return lst
 
         case 'list_item':
             cur, = ast_to_block(ast['children'][0], parent_ref)
+            cur.text = f'{prefix}{cur.text}'
             nested = [ast_to_block(i, cur.ref) for i in ast['children'][1:]]
             return [cur] + list(chain(*nested))
 
@@ -159,10 +165,29 @@ def ast_to_block(
 def gfm_to_blocks(raw: str, pid: str):
     blocks = []
     ref = BlockRef(block_uid=pid)
-    for blk in parse(raw):
-        lst = ast_to_block(cast(dict, blk), ref)
-        if lst:
-            blocks.extend(lst)
+
+    parsed = parse(raw)
+    pid_stack: List[Dict[str, Any]] = [{'level': 0, 'ref': ref}]
+
+    for blk in parsed:
+        blk = cast(dict, blk)
+        if (blk['type']) == 'heading':
+            level = blk['attrs']['level']
+            if level == 1:
+                continue
+            while pid_stack[-1]['level'] >= level:
+                pid_stack.pop()
+        if blk['type'] == 'thematic_break':
+            continue
+        if blk['type'] == 'list':
+            lst = ast_to_block(blk, blocks[-1].ref)
+        else:
+            lst = ast_to_block(blk, pid_stack[-1]['ref'])
+        if not lst:
+            continue
+        if (blk['type']) == 'heading':
+            pid_stack.append({'level': blk['attrs']['level'], 'ref': lst[0].ref})
+        blocks.extend(lst)
     return blocks
 
 
