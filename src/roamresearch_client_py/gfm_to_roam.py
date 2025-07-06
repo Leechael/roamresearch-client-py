@@ -55,6 +55,8 @@ def ast_to_inline(ast: dict) -> str:
                 return text
         case 'softbreak':
             return "\n"
+        case 'linebreak':
+            return "\n\n"
     logger.warn(f'unsupported inline type: {ast["type"]}')
     return ""
 
