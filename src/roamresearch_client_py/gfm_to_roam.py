@@ -21,7 +21,7 @@ def gen_uid():
     return uuid.uuid4().hex
 
 
-def ast_to_inline(ast: dict):
+def ast_to_inline(ast: dict) -> str:
     match ast['type']:
         case 'text':
             if ast.get('attrs', {}).get('url'):
@@ -46,7 +46,13 @@ def ast_to_inline(ast: dict):
             else:
                 return f"*{ast['raw']}*"
         case "link":
-            return ast_to_inline(ast['children'][0])
+            text = ast_to_inline(ast['children'][0])
+            url = ast.get("attrs", {}).get("url")
+            # TODO escape text and url to ensure not breaks
+            if url:
+                return f"[{text}]({url})"
+            else:
+                return text
         case 'softbreak':
             return "\n"
     logger.warn(f'unsupported inline type: {ast["type"]}')
@@ -66,14 +72,11 @@ def ast_to_block(
 
         case 'list':
             nested = [ast_to_block(i, parent_ref) for i in ast['children']]
-            return list(chain(*nested))
-            # if not pid:
-            #     blk = create_block("", None, gen_uid())
-            #     nested = [ast_to_block(i, pid=blk['block']['uid']) for i in ast['children']]
-            #     return [blk] + list(chain(*nested))
-            # else:
-            #     nested = [ast_to_block(i, pid=pid) for i in ast['children']]
-            #     return list(chain(*nested))
+            lst = []
+            for i in ast['children']:
+                blks = ast_to_block(i, parent_ref)
+                lst.extend(blks)
+            return lst
 
         case 'list_item':
             cur, = ast_to_block(ast['children'][0], parent_ref)
