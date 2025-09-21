@@ -180,7 +180,10 @@ def gfm_to_blocks(raw: str, pid: str):
         if blk['type'] == 'thematic_break':
             continue
         if blk['type'] == 'list':
-            lst = ast_to_block(blk, blocks[-1].ref)
+            try:
+                lst = ast_to_block(blk, blocks[-1].ref)
+            except IndexError:
+                lst = ast_to_block(blk, ref)
         else:
             lst = ast_to_block(blk, pid_stack[-1]['ref'])
         if not lst:

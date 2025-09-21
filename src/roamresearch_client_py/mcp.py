@@ -54,9 +54,9 @@ async def get_topic_uid(client, topic: str, when: pendulum.DateTime):
                 [?pid :block/uid "{when.format('MM-DD-YYYY')}"]
         ]
     """)
-    if not block or not block['result']:
+    if not block:
         raise ValueError(f"Topic node {topic} not found for {when.format('MM-DD-YYYY')}")
-    return block['result'][0][0][':block/uid']
+    return block[0][0][':block/uid']
 
 #
 #
@@ -94,10 +94,12 @@ async def save_markdown(title: str, markdown: str) -> str:
         msg = f"Error: {e}"
         if type(e) == httpx.HTTPStatusError:
             msg = f"Error: {e.response.text}\n\n{e.response.status_code}"
-        with open(f'{project_root}/storage/{page_uid}.txt', 'w') as f:
-            f.write(f"{title}\n\n{markdown}\n\n{msg}")
-        logger.info(f"Save debug file: {project_root}/storage/{page_uid}.txt")
         return msg
+    finally:
+        dt = pendulum.now().format('YYYYMMDD')
+        with open(f'{project_root}/storage/{dt}_{page_uid}.md', 'w') as f:
+            f.write(f"{title}\n\n{markdown}")
+        logger.info(f"Save debug file: {project_root}/storage/{dt}_{page_uid}.md")
 
 
 @mcp.tool(name="query", description="Query your Roam Research data with datalog, query MUST be a valid datalog query")
@@ -105,8 +107,8 @@ async def handle_query_roam(q: str) -> str:
     async with RoamClient() as client:
         try:
             result = await client.q(q)
-            if result and result.get("result"):
-                return result["result"]
+            if result:
+                return result
             return pprint.pformat(result)
         except httpx.HTTPStatusError as e:
             print(e.response.text)
@@ -167,8 +169,8 @@ async def get_journaling_by_date(when=None):
         resp = await client.q(query)
     if resp is None:
         return ''
-    logger.info(f'get_journaling_by_date: found {len(resp["result"])} blocks')
-    nodes = list(chain(*(i for i in resp['result'])))
+    logger.info(f'get_journaling_by_date: found {len(resp)} blocks')
+    nodes = list(chain(*(i for i in resp)))
     if topic_node:
         root = list(sorted([i for i in nodes if len(i.get(':block/parents', [])) == 2], key=lambda i: i[':block/order']))
     else:
