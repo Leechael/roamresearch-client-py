@@ -31,5 +31,15 @@ dev = [
 [project.scripts]
 rr = "roamresearch_client_py.cli:main"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/roamresearch_client_py"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/roamresearch_client_py",
+    "README.md",
+    "pyproject.toml",
+]
+
 [tool.pdm.scripts]
 start = "python -m src.roamresearch_client_py.cli mcp"
