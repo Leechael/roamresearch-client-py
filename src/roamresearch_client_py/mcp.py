@@ -22,9 +22,6 @@ from .formatter import format_block
 from .gfm_to_roam import gfm_to_batch_actions
 
 
-project_root = Path(__file__).parent.parent.parent
-
-
 class CancelledErrorFilter(logging.Filter):
     def filter(self, record):
         return "asyncio.exceptions.CancelledError" not in record.getMessage()
@@ -300,11 +297,20 @@ async def save_markdown(title: str, markdown: str) -> str:
         return error_msg
     finally:
         # Save debug file (always, for recovery purposes)
-        dt = pendulum.now().format('YYYYMMDD')
-        debug_file = f'{project_root}/storage/{dt}_{link_block_uid}.md'
-        with open(debug_file, 'w') as f:
-            f.write(f"{title}\n\n{markdown}")
-        logger.info(f"Task {task_id}: Debug file saved: {debug_file}")
+        storage_dir = os.getenv("ROAM_STORAGE_DIR")
+        if storage_dir:
+            try:
+                directory = Path(storage_dir)
+                directory.mkdir(parents=True, exist_ok=True)
+                dt = pendulum.now().format('YYYYMMDD')
+                debug_file = directory / f"{dt}_{link_block_uid}.md"
+                with open(debug_file, 'w') as f:
+                    f.write(f"{title}\n\n{markdown}")
+                logger.info(f"Task {task_id}: Debug file saved: {debug_file}")
+            except Exception as storage_error:
+                logger.warning(f"Task {task_id}: Failed to write debug file: {storage_error}")
+        else:
+            logger.info(f"Task {task_id}: ROAM_STORAGE_DIR not set; skipped saving debug file.")
 
 
 @mcp.tool(name="query", description="Query your Roam Research data with datalog, query MUST be a valid datalog query")
@@ -393,7 +399,7 @@ async def get_journaling_by_date(when=None):
 #
 
 
-async def serve():
+async def serve(host: str | None = None, port: int | None = None):
     load_dotenv()
 
     # Initialize database
@@ -406,8 +412,11 @@ async def serve():
     # FIXME: mount for SSE endpoint, but missed the authorization middleware.
     app.routes.extend(mcp.sse_app().routes)
 
-    host = os.getenv("HOST") and str(os.getenv("HOST")) or mcp.settings.host
-    port = os.getenv("PORT") and int(os.getenv("PORT", 8000)) or mcp.settings.port
+    env_host = os.getenv("HOST")
+    env_port = os.getenv("PORT")
+    host = host or (str(env_host) if env_host else mcp.settings.host)
+    default_port = 9000
+    port = port or (int(env_port) if env_port else default_port)
 
     config = uvicorn.Config(
         app,
