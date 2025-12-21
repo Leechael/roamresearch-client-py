@@ -18,11 +18,9 @@ import httpx
 import pendulum
 
 from .client import RoamClient, create_page, create_block
+from .config import get_env_or_config, get_config_dir
 from .formatter import format_block
 from .gfm_to_roam import gfm_to_batch_actions
-
-
-project_root = Path(__file__).parent.parent.parent
 
 
 class CancelledErrorFilter(logging.Filter):
@@ -68,7 +66,7 @@ async def shutdown_background_tasks(timeout=30):
 # Database management
 def init_db():
     """Initialize SQLite database for task tracking."""
-    db_path = project_root / 'storage' / 'tasks.db'
+    db_path = get_config_dir() / 'tasks.db'
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(db_path))
@@ -96,7 +94,7 @@ def init_db():
 
 def get_db_connection():
     """Get a database connection."""
-    db_path = project_root / 'storage' / 'tasks.db'
+    db_path = get_config_dir() / 'tasks.db'
     return sqlite3.connect(str(db_path))
 
 
@@ -168,8 +166,8 @@ def get_when(when = None):
 
 async def _process_content_blocks_background(task_id: str, page_uid: str, actions: list):
     """Process content blocks in batches in the background."""
-    batch_size = int(os.getenv('BATCH_SIZE', '100'))
-    max_retries = int(os.getenv('MAX_RETRIES', '3'))
+    batch_size = int(get_env_or_config('BATCH_SIZE', 'batch.size', '100'))
+    max_retries = int(get_env_or_config('MAX_RETRIES', 'batch.max_retries', '3'))
 
     total_blocks = len(actions)
     processed = 0
@@ -264,7 +262,7 @@ async def save_markdown(title: str, markdown: str) -> str:
 
         # Phase 1 (Synchronous): Create page + link block
         when = get_when()
-        topic_node = os.getenv("TOPIC_NODE")
+        topic_node = get_env_or_config("TOPIC_NODE", "mcp.topic_node")
 
         async with RoamClient() as client:
             if topic_node:
@@ -300,11 +298,20 @@ async def save_markdown(title: str, markdown: str) -> str:
         return error_msg
     finally:
         # Save debug file (always, for recovery purposes)
-        dt = pendulum.now().format('YYYYMMDD')
-        debug_file = f'{project_root}/storage/{dt}_{link_block_uid}.md'
-        with open(debug_file, 'w') as f:
-            f.write(f"{title}\n\n{markdown}")
-        logger.info(f"Task {task_id}: Debug file saved: {debug_file}")
+        storage_dir = get_env_or_config("ROAM_STORAGE_DIR", "storage.dir")
+        if storage_dir:
+            try:
+                directory = Path(storage_dir)
+                directory.mkdir(parents=True, exist_ok=True)
+                dt = pendulum.now().format('YYYYMMDD')
+                debug_file = directory / f"{dt}_{link_block_uid}.md"
+                with open(debug_file, 'w') as f:
+                    f.write(f"{title}\n\n{markdown}")
+                logger.info(f"Task {task_id}: Debug file saved: {debug_file}")
+            except Exception as storage_error:
+                logger.warning(f"Task {task_id}: Failed to write debug file: {storage_error}")
+        else:
+            logger.info(f"Task {task_id}: ROAM_STORAGE_DIR not set; skipped saving debug file.")
 
 
 @mcp.tool(name="query", description="Query your Roam Research data with datalog, query MUST be a valid datalog query")
@@ -342,7 +349,7 @@ async def get_journaling_by_date(when=None):
         except Exception as e:
             return f"Unrecognized date format: {when}"
     logger.info('get_journaling_by_date: %s', date_obj)
-    topic_node = os.getenv("TOPIC_NODE")
+    topic_node = get_env_or_config("TOPIC_NODE", "mcp.topic_node")
     logger.info('topic_node: %s', topic_node)
     if topic_node:
         query = f"""
@@ -393,7 +400,7 @@ async def get_journaling_by_date(when=None):
 #
 
 
-async def serve():
+async def serve(host: str | None = None, port: int | None = None):
     load_dotenv()
 
     # Initialize database
@@ -406,8 +413,11 @@ async def serve():
     # FIXME: mount for SSE endpoint, but missed the authorization middleware.
     app.routes.extend(mcp.sse_app().routes)
 
-    host = os.getenv("HOST") and str(os.getenv("HOST")) or mcp.settings.host
-    port = os.getenv("PORT") and int(os.getenv("PORT", 8000)) or mcp.settings.port
+    config_host = get_env_or_config("HOST", "mcp.host")
+    config_port = get_env_or_config("PORT", "mcp.port")
+    host = host or (str(config_host) if config_host else mcp.settings.host)
+    default_port = 9000
+    port = port or (int(config_port) if config_port else default_port)
 
     config = uvicorn.Config(
         app,

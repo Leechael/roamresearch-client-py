@@ -22,10 +22,21 @@ async with RoamClient() as c:
 ### Built-in MCP Server
 
 ```bash
-# Starts an SSE MCP server by default
-python -m roamresearch_client_py.mcp
+# Install (either from PyPI or the current directory)
+uv tool install roamresearch-client-py
+# or
+uv tool install .
+
+# Starts an SSE MCP server
+rr mcp
+# Listen on a custom port (defaults to 9000)
+rr mcp --port 9100
+# Provide credentials directly
+rr mcp --token <ROAM_API_TOKEN> --graph <ROAM_API_GRAPH>
+# Write failed payloads somewhere specific
+rr mcp --debug-storage /tmp/rr-debug
 ```
 
 ## Prerequisites
 
-Set `ROAM_API_GRAPH` and `ROAM_API_TOKEN` via environment variables. Or specify them when initializing `RoamClient`.
+Set `ROAM_API_GRAPH` and `ROAM_API_TOKEN` via environment variables. Or specify them when initializing `RoamClient`. To capture failed payloads, set `ROAM_STORAGE_DIR` or pass `--debug-storage`.
