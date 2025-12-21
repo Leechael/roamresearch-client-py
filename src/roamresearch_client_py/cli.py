@@ -5,7 +5,7 @@ from typing import Sequence
 
 from . import __version__
 from .config import init_config_file, CONFIG_FILE
-from .mcp import serve
+from .server import serve
 
 
 def _run_async(coro):

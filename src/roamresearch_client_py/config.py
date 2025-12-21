@@ -19,8 +19,7 @@ def load_config() -> dict[str, Any]:
     """Load configuration from the config file."""
     if not CONFIG_FILE.exists():
         return {}
-    with open(CONFIG_FILE, "r") as f:
-        return toml.loads(f.read())
+    return toml.load(CONFIG_FILE)
 
 
 def get_config_value(key: str, default: Any = None) -> Any:
