@@ -4,6 +4,7 @@ import os
 from typing import Sequence
 
 from . import __version__
+from .config import init_config_file, CONFIG_FILE
 from .mcp import serve
 
 
@@ -49,12 +50,36 @@ def build_parser():
         "--debug-storage",
         help="Directory to write debug payloads (overrides ROAM_STORAGE_DIR env var).",
     )
+
+    init_cmd = subcommands.add_parser(
+        "init",
+        help="Initialize configuration file.",
+        description="Create a default configuration file at ~/.config/roamresearch-client-py/config.toml",
+    )
+    init_cmd.add_argument(
+        "--force",
+        "-f",
+        action="store_true",
+        help="Overwrite existing configuration file.",
+    )
+
     return parser
 
 
 def main(argv: Sequence[str] | None = None):
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "init":
+        if CONFIG_FILE.exists() and not args.force:
+            print(f"Configuration file already exists: {CONFIG_FILE}")
+            print("Use --force to overwrite.")
+            return
+        if args.force and CONFIG_FILE.exists():
+            CONFIG_FILE.unlink()
+        config_path = init_config_file()
+        print(f"Configuration file created: {config_path}")
+        return
 
     if args.command == "mcp":
         if args.token:

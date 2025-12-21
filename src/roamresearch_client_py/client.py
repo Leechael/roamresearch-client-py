@@ -136,10 +136,11 @@ class Block:
 
 class RoamClient(object):
     def __init__(self, api_token: str | None = None, graph: str | None = None):
+        from .config import get_env_or_config
         if api_token is None:
-            api_token = os.getenv("ROAM_API_TOKEN")
+            api_token = get_env_or_config("ROAM_API_TOKEN", "roam.api_token")
         if graph is None:
-            graph = os.getenv("ROAM_API_GRAPH")
+            graph = get_env_or_config("ROAM_API_GRAPH", "roam.api_graph")
         if api_token is None or graph is None:
             raise Exception("ROAM_API_TOKEN and ROAM_API_GRAPH must be set")
         self.api_token = api_token
