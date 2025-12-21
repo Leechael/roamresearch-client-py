@@ -252,3 +252,46 @@ class RoamClient(object):
             now = pendulum.now()
             parent_uid = f"{now.month:02d}-{now.day:02d}-{now.year}"
         return Block(text, parent_uid, open, client=self)
+
+    async def get_page_by_title(self, title: str):
+        """Get a page and all its children by title."""
+        # Escape quotes in title
+        escaped_title = title.replace('"', '\\"')
+        query = f'''
+[:find (pull ?e [*
+                 {{:block/children ...}}
+                 {{:block/refs [*]}}
+                ])
+ :where [?e :node/title "{escaped_title}"]]
+'''
+        resp = await self.q(query)
+        return resp[0][0] if resp else None
+
+    async def search_blocks(self, terms: list[str], limit: int = 20):
+        """Search blocks containing all given terms."""
+        # Build conditions for each term
+        conditions = ['[?e :block/string ?s]']
+        for term in terms:
+            escaped = term.replace('"', '\\"')
+            conditions.append(f'[(clojure.string/includes? ?s "{escaped}")]')
+
+        where_clause = '\n    '.join(conditions)
+        query = f'''
+[:find (pull ?e [:block/string :block/uid :block/page])
+ :where
+    {where_clause}]
+'''
+        resp = await self.q(query)
+        return resp[:limit] if resp else []
+
+    async def get_block_by_uid(self, uid: str):
+        """Get a block and all its children by uid."""
+        query = f'''
+[:find (pull ?e [*
+                 {{:block/children ...}}
+                 {{:block/refs [*]}}
+                ])
+ :where [?e :block/uid "{uid}"]]
+'''
+        resp = await self.q(query)
+        return resp[0][0] if resp else None
