@@ -2,10 +2,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib
+import toml
 
 
 CONFIG_DIR = Path.home() / ".config" / "roamresearch-client-py"
@@ -22,8 +19,8 @@ def load_config() -> dict[str, Any]:
     """Load configuration from the config file."""
     if not CONFIG_FILE.exists():
         return {}
-    with open(CONFIG_FILE, "rb") as f:
-        return tomllib.load(f)
+    with open(CONFIG_FILE, "r") as f:
+        return toml.loads(f.read())
 
 
 def get_config_value(key: str, default: Any = None) -> Any:

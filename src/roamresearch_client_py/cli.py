@@ -91,8 +91,6 @@ def main(argv: Sequence[str] | None = None):
         _run_async(serve(port=args.port))
         return
 
-    parser.error("Unknown command")
-
 
 if __name__ == "__main__":
     main()
