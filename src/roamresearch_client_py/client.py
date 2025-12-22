@@ -135,8 +135,16 @@ class Block:
 
 
 class RoamClient(object):
+    _logging_configured = False
+
     def __init__(self, api_token: str | None = None, graph: str | None = None):
-        from .config import get_env_or_config
+        from .config import get_env_or_config, configure_logging
+
+        # Configure logging once on first client instantiation
+        if not RoamClient._logging_configured:
+            configure_logging()
+            RoamClient._logging_configured = True
+
         if api_token is None:
             api_token = get_env_or_config("ROAM_API_TOKEN", "roam.api_token")
         if graph is None:

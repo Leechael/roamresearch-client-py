@@ -6,7 +6,7 @@ import sys
 from typing import Sequence
 
 from . import __version__
-from .config import init_config_file, CONFIG_FILE
+from .config import init_config_file, CONFIG_FILE, configure_logging
 from .server import serve
 from .client import RoamClient, create_page
 from .gfm_to_roam import gfm_to_batch_actions
@@ -154,6 +154,9 @@ def build_parser():
 
 
 def main(argv: Sequence[str] | None = None):
+    # Configure logging early to suppress httpx INFO logs
+    configure_logging()
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
