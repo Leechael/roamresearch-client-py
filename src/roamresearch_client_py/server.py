@@ -21,7 +21,8 @@ import pendulum
 from .client import RoamClient, create_page, create_block
 from .config import get_env_or_config, get_config_dir
 from .formatter import format_block, format_block_as_markdown
-from .gfm_to_roam import gfm_to_batch_actions
+from .gfm_to_roam import gfm_to_batch_actions, gfm_to_blocks
+from .diff import parse_existing_blocks, diff_block_trees, generate_batch_actions
 
 
 class CancelledErrorFilter(logging.Filter):
@@ -253,6 +254,52 @@ async def _process_content_blocks_background(task_id: str, page_uid: str, action
         error_msg = f"Unexpected error: {str(e)}\n{traceback.format_exc()}"
         logger.error(f"Task {task_id}: {error_msg}")
         update_task(task_id, status='failed', error_message=error_msg, processed_blocks=processed)
+
+
+async def _process_update_actions_background(task_id: str, actions: list):
+    """Process update actions in batches in the background."""
+    batch_size = int(get_env_or_config('BATCH_SIZE', 'batch.size', '100'))
+    max_retries = int(get_env_or_config('MAX_RETRIES', 'batch.max_retries', '3'))
+
+    total_actions = len(actions)
+    processed = 0
+
+    logger.info(f"Task {task_id}: Processing {total_actions} update actions in batches of {batch_size}")
+    update_task(task_id, status='processing')
+
+    async with RoamClient() as client:
+        for i in range(0, total_actions, batch_size):
+            batch = actions[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            total_batches = (total_actions + batch_size - 1) // batch_size
+
+            logger.info(f"Task {task_id}: Processing batch {batch_num}/{total_batches} ({len(batch)} actions)")
+
+            retry_count = 0
+            last_error = None
+
+            while retry_count <= max_retries:
+                try:
+                    await client.batch_actions(batch)
+                    processed += len(batch)
+                    update_task(task_id, processed_blocks=processed)
+                    logger.info(f"Task {task_id}: Batch {batch_num}/{total_batches} completed. Progress: {processed}/{total_actions}")
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    last_error = str(e)
+                    if retry_count <= max_retries:
+                        wait_time = 2 ** retry_count
+                        logger.warning(f"Task {task_id}: Batch {batch_num} failed (attempt {retry_count}/{max_retries}), retrying in {wait_time}s: {e}")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        error_msg = f"Batch {batch_num} failed after {max_retries} retries: {last_error}"
+                        logger.error(f"Task {task_id}: {error_msg}")
+                        update_task(task_id, status='failed', error_message=error_msg, processed_blocks=processed)
+                        return
+
+    update_task(task_id, status='completed', processed_blocks=processed)
+    logger.info(f"Task {task_id}: All {total_actions} actions processed successfully")
 
 
 async def get_topic_uid(client, topic: str, when: pendulum.DateTime):
@@ -511,38 +558,56 @@ Example: update_markdown(identifier="Meeting Notes", markdown="## Updated conten
 async def update_markdown(identifier: str, markdown: str, dry_run: bool = False) -> str:
     uid = parse_uid(identifier)
 
-    try:
-        async with RoamClient() as client:
-            if uid:
-                # Single block update
-                result = await client.update_block_text(uid, markdown.strip(), dry_run=dry_run)
-            else:
-                # Page update with smart diff
-                result = await client.update_page_markdown(identifier, markdown, dry_run=dry_run)
+    async with RoamClient() as client:
+        if uid:
+            # Single block update - synchronous
+            result = await client.update_block_text(uid, markdown.strip(), dry_run=dry_run)
+            stats = result['stats']
+            prefix = "Dry run - would make" if dry_run else "Updated"
+            return f"{prefix}: {stats['updates']} updates"
 
-        stats = result['stats']
-        preserved = result.get('preserved_uids', [])
+        # Page update - compute diff first
+        page = await client.get_page_by_title(identifier)
+        if not page:
+            return f"Error: Page not found: {identifier}"
+
+        page_uid = page.get(':block/uid')
+        if not page_uid:
+            return f"Error: Page has no UID: {identifier}"
+
+        existing_blocks = parse_existing_blocks(page)
+        new_blocks = gfm_to_blocks(markdown, page_uid)
+        diff = diff_block_trees(existing_blocks, new_blocks, page_uid)
+        actions = generate_batch_actions(diff)
+        stats = diff.stats()
+        preserved = list(diff.preserved_uids)
 
         if dry_run:
-            summary = f"Dry run - would make: {stats.get('creates', 0)} creates, " \
-                      f"{stats.get('updates', 0)} updates, {stats.get('moves', 0)} moves, " \
-                      f"{stats.get('deletes', 0)} deletes"
+            summary = f"Dry run - would make: {stats['creates']} creates, " \
+                      f"{stats['updates']} updates, {stats['moves']} moves, " \
+                      f"{stats['deletes']} deletes"
             if preserved:
                 summary += f"\nWould preserve {len(preserved)} block UID(s)"
             return summary
 
-        summary = f"Updated successfully: {stats.get('creates', 0)} creates, " \
-                  f"{stats.get('updates', 0)} updates, {stats.get('moves', 0)} moves, " \
-                  f"{stats.get('deletes', 0)} deletes"
-        if preserved:
-            summary += f"\nPreserved {len(preserved)} block UID(s)"
-        return summary
+        if not actions:
+            return "No changes needed"
 
-    except ValueError as e:
-        return f"Error: {e}"
-    except Exception as e:
-        logger.error(f"update_markdown error: {e}\n{traceback.format_exc()}")
-        return f"Error: {e}"
+        # Save task and start background processing
+        task_id = uuid.uuid4().hex
+        save_task(task_id, page_uid, f"[UPDATE] {identifier}", markdown, 'pending', len(actions))
+
+        create_background_task(
+            _process_update_actions_background(task_id, actions)
+        )
+
+        summary = f"Task {task_id} started. Updating [[{identifier}]]: " \
+                  f"{stats['creates']} creates, {stats['updates']} updates, " \
+                  f"{stats['moves']} moves, {stats['deletes']} deletes. " \
+                  f"Processing {len(actions)} actions in background."
+        if preserved:
+            summary += f"\nPreserving {len(preserved)} block UID(s)"
+        return summary
 
 
 @mcp.tool(
