@@ -94,6 +94,51 @@ class Block:
             assert self._heading <= 3
             dic["block"]["heading"] = self._heading
         return dic
+
+    def to_update_action(self, include_text: bool = True) -> dict:
+        """
+        Generate update-block action.
+
+        Can update: string, heading, open, text-align, children-view-type
+        Cannot update: order, parent (use to_move_action for those)
+        """
+        action = {
+            "action": "update-block",
+            "block": {"uid": self.ref.block_uid}
+        }
+        if include_text and self.text is not None:
+            action["block"]["string"] = self.text
+        if self._heading is not None:
+            action["block"]["heading"] = self._heading
+        if self.open is not None:
+            action["block"]["open"] = self.open
+        return action
+
+    def to_move_action(self, parent_uid: str, order: int | str = "last") -> dict:
+        """
+        Generate move-block action.
+
+        Use this to change parent or order of a block while preserving its UID.
+        """
+        return {
+            "action": "move-block",
+            "block": {"uid": self.ref.block_uid},
+            "location": {
+                "parent-uid": parent_uid,
+                "order": order
+            }
+        }
+
+    def to_delete_action(self) -> dict:
+        """
+        Generate delete-block action.
+
+        Warning: This will recursively delete all children blocks.
+        """
+        return {
+            "action": "delete-block",
+            "block": {"uid": self.ref.block_uid}
+        }
     
     @classmethod
     def from_dict(cls, action: dict):
