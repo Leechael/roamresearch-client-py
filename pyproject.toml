@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "roamresearch-client-py"
-version = "0.3.0"
+version = "0.3.1"
 description = "Roam Research Python client with built-in CLI and MCP server support."
 authors = [
     {name = "Leechael Yim", email = "yanleech@gmail.com"},
