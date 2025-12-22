@@ -86,33 +86,17 @@ def build_parser():
         help="Markdown file to save. If not provided, reads from stdin.",
     )
 
-    # page command
-    page_cmd = subcommands.add_parser(
-        "page",
-        help="Read a page and output as markdown.",
-        description="Fetch a page by title and output its content as GFM markdown.",
+    # get command (supports both page title and uid)
+    get_cmd = subcommands.add_parser(
+        "get",
+        help="Read a page or block and output as markdown.",
+        description="Fetch a page by title or block by uid and output its content as GFM markdown.",
     )
-    page_cmd.add_argument(
-        "title",
-        help="Title of the page to read.",
+    get_cmd.add_argument(
+        "identifier",
+        help="Page title or block uid (accepts ((uid)) format).",
     )
-    page_cmd.add_argument(
-        "--debug",
-        action="store_true",
-        help="Output raw JSON data instead of markdown.",
-    )
-
-    # uid command
-    uid_cmd = subcommands.add_parser(
-        "uid",
-        help="Read a block by uid and output as markdown.",
-        description="Fetch a block by uid and output its content as GFM markdown.",
-    )
-    uid_cmd.add_argument(
-        "uid",
-        help="Block uid (accepts ((uid)) or uid format).",
-    )
-    uid_cmd.add_argument(
+    get_cmd.add_argument(
         "--debug",
         action="store_true",
         help="Output raw JSON data instead of markdown.",
@@ -128,6 +112,17 @@ def build_parser():
         "terms",
         nargs='+',
         help="Search terms (all must match).",
+    )
+    search_cmd.add_argument(
+        "--page",
+        "-p",
+        help="Limit search to a specific page title.",
+    )
+    search_cmd.add_argument(
+        "--ignore-case",
+        "-i",
+        action="store_true",
+        help="Case-insensitive search.",
     )
     search_cmd.add_argument(
         "--limit",
@@ -169,16 +164,17 @@ def main(argv: Sequence[str] | None = None):
         _run_async(_save_markdown(args.title, args.file))
         return
 
-    if args.command == "page":
-        _run_async(_read_page(args.title, args.debug))
-        return
-
-    if args.command == "uid":
-        _run_async(_read_uid(args.uid, args.debug))
+    if args.command == "get":
+        _run_async(_get(args.identifier, args.debug))
         return
 
     if args.command == "search":
-        _run_async(_search_blocks(args.terms, args.limit))
+        _run_async(_search_blocks(
+            args.terms,
+            args.limit,
+            case_sensitive=not args.ignore_case,
+            page_title=args.page
+        ))
         return
 
 
@@ -204,73 +200,108 @@ async def _save_markdown(title: str, file_path: str | None):
     print(f"Saved page: {title}")
 
 
-async def _read_page(title: str, debug: bool = False):
-    """Read a page and output as markdown."""
-    async with RoamClient() as client:
-        page = await client.get_page_by_title(title)
+def _parse_uid(identifier: str) -> str | None:
+    """
+    Parse uid from ((uid)) or uid format.
+    Returns None if identifier looks like a page title.
+    """
+    identifier = identifier.strip()
 
-    if not page:
-        print(f"Error: Page '{title}' not found.", file=sys.stderr)
+    # Wrapped in (()) - definitely a uid
+    if identifier.startswith('((') and identifier.endswith('))'):
+        return identifier[2:-2]
+
+    # Contains spaces or CJK characters - likely a page title
+    if ' ' in identifier or any('\u4e00' <= c <= '\u9fff' for c in identifier):
+        return None
+
+    # Short alphanumeric with possible - and _ could be uid
+    # Roam uids are typically 9 chars or 32 hex chars
+    if len(identifier) <= 40 and all(c.isalnum() or c in '-_' for c in identifier):
+        return identifier
+
+    return None
+
+
+async def _get(identifier: str, debug: bool = False):
+    """Read a page or block and output as markdown."""
+    uid = _parse_uid(identifier)
+
+    async with RoamClient() as client:
+        result = None
+        is_page = False
+
+        # Try as uid first if it looks like one
+        if uid:
+            result = await client.get_block_by_uid(uid)
+
+        # If not found or doesn't look like uid, try as page title
+        if not result:
+            result = await client.get_page_by_title(identifier)
+            is_page = True
+
+    if not result:
+        print(f"Error: '{identifier}' not found.", file=sys.stderr)
         return
 
     if debug:
-        print(json.dumps(page, indent=2, ensure_ascii=False))
+        print(json.dumps(result, indent=2, ensure_ascii=False))
         return
 
-    # Get top-level children
-    children = page.get(':block/children', [])
+    # Get children
+    children = result.get(':block/children', [])
     if children:
         children = sorted(children, key=lambda x: x.get(':block/order', 0))
 
-    output = format_block_as_markdown(children)
+    if is_page:
+        # For pages, format children directly
+        output = format_block_as_markdown(children)
+    else:
+        # For blocks, include the block itself
+        output = format_block_as_markdown([result])
+
     print(output)
 
 
-def _parse_uid(uid: str) -> str:
-    """Parse uid from ((uid)) or uid format."""
-    uid = uid.strip()
-    if uid.startswith('((') and uid.endswith('))'):
-        return uid[2:-2]
-    return uid
-
-
-async def _read_uid(uid: str, debug: bool = False):
-    """Read a block by uid and output as markdown."""
-    uid = _parse_uid(uid)
-
+async def _search_blocks(
+    terms: list[str],
+    limit: int,
+    case_sensitive: bool = True,
+    page_title: str | None = None
+):
+    """Search blocks and output results grouped by page."""
     async with RoamClient() as client:
-        block = await client.get_block_by_uid(uid)
-
-    if not block:
-        print(f"Error: Block '{uid}' not found.", file=sys.stderr)
-        return
-
-    if debug:
-        print(json.dumps(block, indent=2, ensure_ascii=False))
-        return
-
-    # Format the block itself and its children
-    output = format_block_as_markdown([block])
-    print(output)
-
-
-async def _search_blocks(terms: list[str], limit: int):
-    """Search blocks and output results."""
-    async with RoamClient() as client:
-        results = await client.search_blocks(terms, limit)
+        results = await client.search_blocks(
+            terms,
+            limit,
+            case_sensitive=case_sensitive,
+            page_title=page_title
+        )
 
     if not results:
         print("No results found.")
         return
 
+    # Group results by page (preserving sort order from client)
+    by_page: dict[str, list[tuple[str, str]]] = {}
+    page_order: list[str] = []
     for item in results:
-        block = item[0]
-        uid = block.get(':block/uid', '')
-        text = block.get(':block/string', '')
-        # Truncate long text
-        if len(text) > 80:
-            text = text[:77] + "..."
-        print(f"(({uid})) {text}")
+        uid, text, page = item[0], item[1], item[2]
+        if page not in by_page:
+            by_page[page] = []
+            page_order.append(page)
+        by_page[page].append((uid, text))
+
+    # Output grouped by page
+    for page in page_order:
+        blocks = by_page[page]
+        print(f"[[{page}]]")
+        for uid, text in blocks:
+            display_text = text.replace('\n', ' ')
+            if len(display_text) > 60:
+                display_text = display_text[:57] + "..."
+            print(f"  {uid}   {display_text}")
+        print()
 
 
 if __name__ == "__main__":
