@@ -206,7 +206,7 @@ def main(argv: Sequence[str] | None = None):
 async def _save_markdown(title: str, file_path: str | None):
     """Save markdown content to Roam as a new page."""
     if file_path:
-        with open(file_path, 'r') as f:
+        with open(file_path, 'r', encoding='utf-8') as f:
             markdown = f.read()
     else:
         markdown = sys.stdin.read()

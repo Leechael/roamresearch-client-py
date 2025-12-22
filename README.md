@@ -2,7 +2,7 @@
 
 This is another Roam Research Python Client with opinionated design.
 
-Hightlight:
+Highlight:
 - Built-in CLI & MCP supports which should be LLM & Agent friendly.
 - Pythonic coding API for building templates.
 
