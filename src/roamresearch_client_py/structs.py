@@ -99,7 +99,7 @@ class Block:
         """
         Generate update-block action.
 
-        Can update: string, heading, open, text-align, children-view-type
+        Can update: string, heading, open
         Cannot update: order, parent (use to_move_action for those)
         """
         action = {

@@ -450,7 +450,7 @@ class RoamClient(object):
             dict with:
                 - 'actions': list of executed actions
                 - 'stats': counts of creates, updates, moves, deletes
-                - 'preserved_uids': set of UIDs that were reused
+                - 'preserved_uids': list of UIDs that were reused
 
         Raises:
             ValueError: If page not found or markdown is empty

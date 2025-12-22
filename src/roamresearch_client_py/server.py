@@ -164,6 +164,21 @@ def get_when(when = None):
     return date_obj
 
 
+def parse_uid(s: str) -> str | None:
+    """
+    Parse uid from ((uid)) or uid format.
+    Returns None if identifier looks like a page title.
+    """
+    s = s.strip()
+    if s.startswith('((') and s.endswith('))'):
+        return s[2:-2]
+    if ' ' in s or any('\u4e00' <= c <= '\u9fff' for c in s):
+        return None
+    if len(s) <= 40 and all(c.isalnum() or c in '-_' for c in s):
+        return s
+    return None
+
+
 async def _process_content_blocks_background(task_id: str, page_uid: str, actions: list):
     """Process content blocks in batches in the background."""
     batch_size = int(get_env_or_config('BATCH_SIZE', 'batch.size', '100'))
@@ -360,16 +375,6 @@ Example: get(identifier="Project Notes") or get(identifier="abc123xyz")
 """
 )
 async def handle_get(identifier: str, raw: bool = False) -> str:
-    def parse_uid(s: str) -> str | None:
-        s = s.strip()
-        if s.startswith('((') and s.endswith('))'):
-            return s[2:-2]
-        if ' ' in s or any('\u4e00' <= c <= '\u9fff' for c in s):
-            return None
-        if len(s) <= 40 and all(c.isalnum() or c in '-_' for c in s):
-            return s
-        return None
-
     uid = parse_uid(identifier)
 
     try:
@@ -484,16 +489,6 @@ Example: update_markdown(identifier="Meeting Notes", markdown="## Updated conten
 """
 )
 async def update_markdown(identifier: str, markdown: str, dry_run: bool = False) -> str:
-    def parse_uid(s: str) -> str | None:
-        s = s.strip()
-        if s.startswith('((') and s.endswith('))'):
-            return s[2:-2]
-        if ' ' in s or any('\u4e00' <= c <= '\u9fff' for c in s):
-            return None
-        if len(s) <= 40 and all(c.isalnum() or c in '-_' for c in s):
-            return s
-        return None
-
     uid = parse_uid(identifier)
 
     try:

@@ -380,11 +380,13 @@ async def _query(query: str | None, args: list[str] | None):
 async def _update(identifier: str, file_path: str | None, dry_run: bool, force: bool):
     """Update existing page/block with new markdown."""
     # Read new content
+    stdin_used = False
     if file_path:
         with open(file_path, 'r', encoding='utf-8') as f:
             markdown = f.read()
     else:
         markdown = sys.stdin.read()
+        stdin_used = True
 
     if not markdown.strip():
         print("Error: No content provided.", file=sys.stderr)
@@ -431,6 +433,11 @@ async def _update(identifier: str, file_path: str | None, dry_run: bool, force: 
 
         # Confirm if deletes and not forced
         if not force and stats.get('deletes', 0) > 0:
+            if stdin_used:
+                # Cannot prompt for confirmation when stdin was used for content
+                print(f"Error: This will delete {stats['deletes']} block(s). "
+                      "Use --force to confirm when reading from stdin.", file=sys.stderr)
+                return
             confirm = input(f"This will delete {stats['deletes']} block(s). Continue? [y/N] ")
             if confirm.lower() != 'y':
                 print("Aborted.")
