@@ -14,6 +14,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 import httpx
 import pendulum
 
@@ -31,7 +32,26 @@ for logger_name in ("uvicorn.error", "uvicorn.access", "uvicorn", "starlette"):
     logging.getLogger(logger_name).addFilter(CancelledErrorFilter())
 
 
-mcp = FastMCP(name="RoamResearch", stateless_http=True)
+def _get_transport_security() -> TransportSecuritySettings | None:
+    """Get transport security settings from config."""
+    allowed_hosts_str = get_env_or_config("ALLOWED_HOSTS", "mcp.allowed_hosts")
+    if not allowed_hosts_str:
+        # Default: disable DNS rebinding protection for remote MCP servers
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    allowed_hosts = [h.strip() for h in str(allowed_hosts_str).split(",") if h.strip()]
+    # Also allow localhost variants
+    allowed_hosts.extend(["127.0.0.1:*", "localhost:*", "[::1]:*"])
+    allowed_origins = [f"https://{h.split(':')[0]}" for h in allowed_hosts if not h.startswith(("127.", "localhost", "[::1]"))]
+    allowed_origins.extend(["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"])
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+mcp = FastMCP(name="RoamResearch", stateless_http=True, transport_security=_get_transport_security())
 logger = logging.getLogger(__name__)
 
 # Background task management

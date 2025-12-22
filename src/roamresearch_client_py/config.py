@@ -65,6 +65,7 @@ def init_config_file() -> Path:
 # host = "127.0.0.1"
 # port = 9000
 # topic_node = ""
+# allowed_hosts = ""  # Comma-separated list of allowed hosts for remote MCP
 
 [storage]
 # dir = ""  # Directory for debug files
