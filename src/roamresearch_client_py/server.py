@@ -164,6 +164,21 @@ def get_when(when = None):
     return date_obj
 
 
+def parse_uid(s: str) -> str | None:
+    """
+    Parse uid from ((uid)) or uid format.
+    Returns None if identifier looks like a page title.
+    """
+    s = s.strip()
+    if s.startswith('((') and s.endswith('))'):
+        return s[2:-2]
+    if ' ' in s or any('\u4e00' <= c <= '\u9fff' for c in s):
+        return None
+    if len(s) <= 40 and all(c.isalnum() or c in '-_' for c in s):
+        return s
+    return None
+
+
 async def _process_content_blocks_background(task_id: str, page_uid: str, actions: list):
     """Process content blocks in batches in the background."""
     batch_size = int(get_env_or_config('BATCH_SIZE', 'batch.size', '100'))
@@ -360,16 +375,6 @@ Example: get(identifier="Project Notes") or get(identifier="abc123xyz")
 """
 )
 async def handle_get(identifier: str, raw: bool = False) -> str:
-    def parse_uid(s: str) -> str | None:
-        s = s.strip()
-        if s.startswith('((') and s.endswith('))'):
-            return s[2:-2]
-        if ' ' in s or any('\u4e00' <= c <= '\u9fff' for c in s):
-            return None
-        if len(s) <= 40 and all(c.isalnum() or c in '-_' for c in s):
-            return s
-        return None
-
     uid = parse_uid(identifier)
 
     try:
@@ -462,6 +467,61 @@ async def handle_search(
         return "\n".join(lines)
 
     except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    name="update_markdown",
+    description="""Update an existing Roam Research page or block with new markdown content.
+
+Parameters:
+- identifier: Page title or block UID to update
+- markdown: New content in GitHub Flavored Markdown (GFM)
+- dry_run: If true, return preview without making changes. Default: false.
+
+Returns: Summary of changes made (creates, updates, moves, deletes) and preserved UIDs.
+
+IMPORTANT: This preserves existing block UIDs where possible to maintain references.
+Blocks with identical text are matched and reused. Order/parent changes use move-block
+to preserve UIDs. Only truly new/deleted content uses create/delete actions.
+
+Example: update_markdown(identifier="Meeting Notes", markdown="## Updated content")
+"""
+)
+async def update_markdown(identifier: str, markdown: str, dry_run: bool = False) -> str:
+    uid = parse_uid(identifier)
+
+    try:
+        async with RoamClient() as client:
+            if uid:
+                # Single block update
+                result = await client.update_block_text(uid, markdown.strip(), dry_run=dry_run)
+            else:
+                # Page update with smart diff
+                result = await client.update_page_markdown(identifier, markdown, dry_run=dry_run)
+
+        stats = result['stats']
+        preserved = result.get('preserved_uids', [])
+
+        if dry_run:
+            summary = f"Dry run - would make: {stats.get('creates', 0)} creates, " \
+                      f"{stats.get('updates', 0)} updates, {stats.get('moves', 0)} moves, " \
+                      f"{stats.get('deletes', 0)} deletes"
+            if preserved:
+                summary += f"\nWould preserve {len(preserved)} block UID(s)"
+            return summary
+
+        summary = f"Updated successfully: {stats.get('creates', 0)} creates, " \
+                  f"{stats.get('updates', 0)} updates, {stats.get('moves', 0)} moves, " \
+                  f"{stats.get('deletes', 0)} deletes"
+        if preserved:
+            summary += f"\nPreserved {len(preserved)} block UID(s)"
+        return summary
+
+    except ValueError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        logger.error(f"update_markdown error: {e}\n{traceback.format_exc()}")
         return f"Error: {e}"
 
 

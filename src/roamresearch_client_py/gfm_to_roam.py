@@ -76,10 +76,10 @@ def ast_to_block(
         case 'list':
             nested = [ast_to_block(i, parent_ref) for i in ast['children']]
             lst = []
-            list_type = ast.get('attrs', {}).get('ordered') and 'ordered' or 'numeric'
+            is_ordered = ast.get('attrs', {}).get('ordered', False)
             for idx, i in enumerate(ast['children']):
                 prefix = ''
-                if list_type == 'numeric':
+                if is_ordered:
                     prefix = f'{idx+1}. '
                 blks = ast_to_block(i, parent_ref, prefix)
                 lst.extend(blks)

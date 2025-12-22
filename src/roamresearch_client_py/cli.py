@@ -150,6 +150,33 @@ def build_parser():
         help="Query arguments (optional).",
     )
 
+    # update command
+    update_cmd = subcommands.add_parser(
+        "update",
+        help="Update an existing page or block with new markdown.",
+        description="Update page/block content, preserving block UIDs where possible.",
+    )
+    update_cmd.add_argument(
+        "identifier",
+        help="Page title or block UID to update.",
+    )
+    update_cmd.add_argument(
+        "--file",
+        "-f",
+        help="Markdown file with new content. If not provided, reads from stdin.",
+    )
+    update_cmd.add_argument(
+        "--dry-run",
+        "-n",
+        action="store_true",
+        help="Show what would be changed without making changes.",
+    )
+    update_cmd.add_argument(
+        "--force",
+        action="store_true",
+        help="Update without confirmation prompt for deletes.",
+    )
+
     return parser
 
 
@@ -200,6 +227,10 @@ def main(argv: Sequence[str] | None = None):
 
     if args.command == "q":
         _run_async(_query(args.query, args.args))
+        return
+
+    if args.command == "update":
+        _run_async(_update(args.identifier, args.file, args.dry_run, args.force))
         return
 
 
@@ -344,6 +375,90 @@ async def _query(query: str | None, args: list[str] | None):
         result = await client.q(q, args)
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+async def _update(identifier: str, file_path: str | None, dry_run: bool, force: bool):
+    """Update existing page/block with new markdown."""
+    # Read new content
+    stdin_used = False
+    if file_path:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            markdown = f.read()
+    else:
+        markdown = sys.stdin.read()
+        stdin_used = True
+
+    if not markdown.strip():
+        print("Error: No content provided.", file=sys.stderr)
+        return
+
+    uid = _parse_uid(identifier)
+
+    try:
+        async with RoamClient() as client:
+            if uid:
+                # Single block update - just update text
+                result = await client.update_block_text(uid, markdown.strip(), dry_run=True)
+            else:
+                # Page update - smart diff
+                result = await client.update_page_markdown(identifier, markdown, dry_run=True)
+
+        # Show preview
+        stats = result['stats']
+        print(f"Changes: {stats.get('creates', 0)} creates, "
+              f"{stats.get('updates', 0)} updates, "
+              f"{stats.get('moves', 0)} moves, "
+              f"{stats.get('deletes', 0)} deletes")
+
+        if dry_run:
+            if result['actions']:
+                print("\nActions that would be taken:")
+                for action in result['actions']:
+                    action_type = action.get('action', 'unknown')
+                    block_uid = action.get('block', {}).get('uid', 'N/A')
+                    if action_type == 'create-block':
+                        text = action.get('block', {}).get('string', '')[:50]
+                        print(f"  + create: {text}...")
+                    elif action_type == 'update-block':
+                        text = action.get('block', {}).get('string', '')[:50]
+                        print(f"  ~ update {block_uid}: {text}...")
+                    elif action_type == 'move-block':
+                        order = action.get('location', {}).get('order', '?')
+                        print(f"  > move {block_uid} to order {order}")
+                    elif action_type == 'delete-block':
+                        print(f"  - delete {block_uid}")
+            else:
+                print("No changes needed.")
+            return
+
+        # Confirm if deletes and not forced
+        if not force and stats.get('deletes', 0) > 0:
+            if stdin_used:
+                # Cannot prompt for confirmation when stdin was used for content
+                print(f"Error: This will delete {stats['deletes']} block(s). "
+                      "Use --force to confirm when reading from stdin.", file=sys.stderr)
+                return
+            confirm = input(f"This will delete {stats['deletes']} block(s). Continue? [y/N] ")
+            if confirm.lower() != 'y':
+                print("Aborted.")
+                return
+
+        # Execute update
+        async with RoamClient() as client:
+            if uid:
+                await client.update_block_text(uid, markdown.strip())
+            else:
+                await client.update_page_markdown(identifier, markdown)
+
+        print("Updated successfully.")
+
+        if result.get('preserved_uids'):
+            print(f"Preserved {len(result['preserved_uids'])} block UID(s).")
+
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

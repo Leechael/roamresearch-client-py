@@ -59,6 +59,12 @@ rr search "term1" "term2" --ignore-case --limit 50
 rr save --title "New Page" --file content.md
 echo "# Hello" | rr save --title "New Page"
 
+# Update existing page or block (smart diff, preserves UIDs)
+rr update "Page Title" --file updated.md
+rr update "Page Title" --file updated.md --dry-run  # Preview changes
+rr update "((block-uid))" --file content.md
+echo "new content" | rr update "Page Title" --force
+
 # Execute raw datalog query
 rr q '[:find ?title :where [?e :node/title ?title]]'
 
@@ -99,6 +105,29 @@ async with RoamClient() as client:
 
     # Raw datalog query
     result = await client.q('[:find ?title :where [?e :node/title ?title]]')
+```
+
+### Update Existing Content
+
+```python
+async with RoamClient() as client:
+    # Update a single block's text
+    result = await client.update_block_text(
+        uid="block-uid",
+        text="Updated content",
+        dry_run=False  # Set True to preview without executing
+    )
+
+    # Update entire page with smart diff (preserves block UIDs)
+    result = await client.update_page_markdown(
+        title="Page Title",
+        markdown="## New content\n- Item 1\n- Item 2",
+        dry_run=False
+    )
+
+    # Result contains stats and preserved UIDs
+    print(result['stats'])  # {'creates': 0, 'updates': 2, 'moves': 0, 'deletes': 0}
+    print(result['preserved_uids'])  # List of reused block UIDs
 ```
 
 ## MCP Server
