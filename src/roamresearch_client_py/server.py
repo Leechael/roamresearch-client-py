@@ -466,6 +466,71 @@ async def handle_search(
 
 
 @mcp.tool(
+    name="update_markdown",
+    description="""Update an existing Roam Research page or block with new markdown content.
+
+Parameters:
+- identifier: Page title or block UID to update
+- markdown: New content in GitHub Flavored Markdown (GFM)
+- dry_run: If true, return preview without making changes. Default: false.
+
+Returns: Summary of changes made (creates, updates, moves, deletes) and preserved UIDs.
+
+IMPORTANT: This preserves existing block UIDs where possible to maintain references.
+Blocks with identical text are matched and reused. Order/parent changes use move-block
+to preserve UIDs. Only truly new/deleted content uses create/delete actions.
+
+Example: update_markdown(identifier="Meeting Notes", markdown="## Updated content")
+"""
+)
+async def update_markdown(identifier: str, markdown: str, dry_run: bool = False) -> str:
+    def parse_uid(s: str) -> str | None:
+        s = s.strip()
+        if s.startswith('((') and s.endswith('))'):
+            return s[2:-2]
+        if ' ' in s or any('\u4e00' <= c <= '\u9fff' for c in s):
+            return None
+        if len(s) <= 40 and all(c.isalnum() or c in '-_' for c in s):
+            return s
+        return None
+
+    uid = parse_uid(identifier)
+
+    try:
+        async with RoamClient() as client:
+            if uid:
+                # Single block update
+                result = await client.update_block_text(uid, markdown.strip(), dry_run=dry_run)
+            else:
+                # Page update with smart diff
+                result = await client.update_page_markdown(identifier, markdown, dry_run=dry_run)
+
+        stats = result['stats']
+        preserved = result.get('preserved_uids', [])
+
+        if dry_run:
+            summary = f"Dry run - would make: {stats.get('creates', 0)} creates, " \
+                      f"{stats.get('updates', 0)} updates, {stats.get('moves', 0)} moves, " \
+                      f"{stats.get('deletes', 0)} deletes"
+            if preserved:
+                summary += f"\nWould preserve {len(preserved)} block UID(s)"
+            return summary
+
+        summary = f"Updated successfully: {stats.get('creates', 0)} creates, " \
+                  f"{stats.get('updates', 0)} updates, {stats.get('moves', 0)} moves, " \
+                  f"{stats.get('deletes', 0)} deletes"
+        if preserved:
+            summary += f"\nPreserved {len(preserved)} block UID(s)"
+        return summary
+
+    except ValueError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        logger.error(f"update_markdown error: {e}\n{traceback.format_exc()}")
+        return f"Error: {e}"
+
+
+@mcp.tool(
     name="get_journaling_by_date",
     description="""Get journal entries from Daily Notes for a specific date.
 
