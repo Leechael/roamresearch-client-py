@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -71,7 +72,48 @@ def init_config_file() -> Path:
 [batch]
 # size = 100
 # max_retries = 3
+
+[logging]
+# level = "WARNING"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+# httpx_level = "WARNING"  # Control httpx library logging separately
 """
         with open(CONFIG_FILE, "w") as f:
             f.write(default_config)
     return CONFIG_FILE
+
+
+def configure_logging(
+    level: str | None = None,
+    httpx_level: str | None = None,
+) -> None:
+    """Configure logging levels for the library and httpx.
+
+    Args:
+        level: Log level for roamresearch_client_py (default from config or WARNING)
+        httpx_level: Log level for httpx library (default from config or WARNING)
+    """
+    # Get levels from config if not provided
+    if level is None:
+        level = get_env_or_config("ROAM_LOG_LEVEL", "logging.level", "WARNING")
+    if httpx_level is None:
+        httpx_level = get_env_or_config("ROAM_HTTPX_LOG_LEVEL", "logging.httpx_level", "WARNING")
+
+    # Convert string to logging level
+    level_map = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
+    }
+
+    log_level = level_map.get(level.upper(), logging.WARNING)
+    httpx_log_level = level_map.get(httpx_level.upper(), logging.WARNING)
+
+    # Configure roamresearch_client_py logger
+    logger = logging.getLogger("roamresearch_client_py")
+    logger.setLevel(log_level)
+
+    # Configure httpx and httpcore loggers
+    logging.getLogger("httpx").setLevel(httpx_log_level)
+    logging.getLogger("httpcore").setLevel(httpx_log_level)

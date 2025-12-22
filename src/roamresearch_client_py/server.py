@@ -19,7 +19,7 @@ import pendulum
 
 from .client import RoamClient, create_page, create_block
 from .config import get_env_or_config, get_config_dir
-from .formatter import format_block
+from .formatter import format_block, format_block_as_markdown
 from .gfm_to_roam import gfm_to_batch_actions
 
 
@@ -238,11 +238,17 @@ async def get_topic_uid(client, topic: str, when: pendulum.DateTime):
 
 
 @mcp.tool(
-    description="""Save a markdown doc into Roam Research's Daily Notes.
+    name="save_markdown",
+    description="""Save a markdown document to Roam Research as a new page, with a link added to today's Daily Notes.
 
-    - title: should be plaintext of the document title.
-    - markdown: should be GitHub Flavored Markdown (GFM) format. Do not include title as H1 in markdown.
-    """
+Parameters:
+- title: Page title (plain text, no markdown)
+- markdown: Document content in GitHub Flavored Markdown (GFM). Do not include title as H1.
+
+Returns: Task ID and page link. Content blocks are processed in background.
+
+Example: save_markdown(title="Meeting Notes", markdown="## Attendees\\n- Alice\\n- Bob")
+"""
 )
 async def save_markdown(title: str, markdown: str) -> str:
     # Generate unique IDs
@@ -314,7 +320,18 @@ async def save_markdown(title: str, markdown: str) -> str:
             logger.info(f"Task {task_id}: ROAM_STORAGE_DIR not set; skipped saving debug file.")
 
 
-@mcp.tool(name="query", description="Query your Roam Research data with datalog, query MUST be a valid datalog query")
+@mcp.tool(
+    name="query",
+    description="""Execute a Datalog query against your Roam Research graph.
+
+Parameters:
+- q: Valid Datalog query string
+
+Returns: Query results as JSON.
+
+Example: query(q="[:find ?title :where [?e :node/title ?title]]")
+"""
+)
 async def handle_query_roam(q: str) -> str:
     async with RoamClient() as client:
         try:
@@ -330,15 +347,135 @@ async def handle_query_roam(q: str) -> str:
 
 
 @mcp.tool(
-    description="""Get the journaling for a given date. If no date is provided, the current date will be used.
-    The date string should be in ISO8601, RFC2822, or RFC3339 format.
-    Example:
-    ```
-    get_journaling_by_date("2021-01-01")
-    get_journaling_by_date("2021-01-01T00:00:00Z")
-    get_journaling_by_date("2021-01-01 00:00:00")
-    ```
-    """
+    name="get",
+    description="""Read a page or block from Roam Research and return its content as markdown.
+
+Parameters:
+- identifier: Page title or block UID. Accepts "((uid))" format for block references.
+- raw: If true, return raw JSON instead of markdown. Default: false.
+
+Returns: Page/block content as GFM markdown, or JSON if raw=true.
+
+Example: get(identifier="Project Notes") or get(identifier="abc123xyz")
+"""
+)
+async def handle_get(identifier: str, raw: bool = False) -> str:
+    def parse_uid(s: str) -> str | None:
+        s = s.strip()
+        if s.startswith('((') and s.endswith('))'):
+            return s[2:-2]
+        if ' ' in s or any('\u4e00' <= c <= '\u9fff' for c in s):
+            return None
+        if len(s) <= 40 and all(c.isalnum() or c in '-_' for c in s):
+            return s
+        return None
+
+    uid = parse_uid(identifier)
+
+    try:
+        async with RoamClient() as client:
+            result = None
+            is_page = False
+
+            if uid:
+                result = await client.get_block_by_uid(uid)
+
+            if not result:
+                result = await client.get_page_by_title(identifier)
+                is_page = True
+
+        if not result:
+            return f"Error: '{identifier}' not found."
+
+        if raw:
+            import json
+            return json.dumps(result, indent=2, ensure_ascii=False)
+
+        children = result.get(':block/children', [])
+        if children:
+            children = sorted(children, key=lambda x: x.get(':block/order', 0))
+
+        if is_page:
+            return format_block_as_markdown(children)
+        else:
+            return format_block_as_markdown([result])
+
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    name="search",
+    description="""Search for blocks containing specified terms in Roam Research.
+
+Parameters:
+- terms: List of search terms. All terms must match (AND logic).
+- page: Limit search to a specific page title. Optional.
+- case_sensitive: Case-sensitive matching. Default: true.
+- limit: Maximum results to return. Default: 20.
+
+Returns: Matching blocks grouped by page, showing UID and text preview.
+
+Example: search(terms=["python", "async"]) or search(terms=["todo"], page="Project Notes")
+"""
+)
+async def handle_search(
+    terms: List[str],
+    page: str | None = None,
+    case_sensitive: bool = True,
+    limit: int = 20
+) -> str:
+    try:
+        async with RoamClient() as client:
+            results = await client.search_blocks(
+                terms,
+                limit,
+                case_sensitive=case_sensitive,
+                page_title=page
+            )
+
+        if not results:
+            return "No results found."
+
+        # Group results by page
+        by_page: dict[str, list[tuple[str, str]]] = {}
+        page_order: list[str] = []
+        for item in results:
+            uid, text, page_title = item[0], item[1], item[2]
+            if page_title not in by_page:
+                by_page[page_title] = []
+                page_order.append(page_title)
+            by_page[page_title].append((uid, text))
+
+        # Format output
+        lines = []
+        for page_title in page_order:
+            blocks = by_page[page_title]
+            lines.append(f"[[{page_title}]]")
+            for uid, text in blocks:
+                display_text = text.replace('\n', ' ')
+                if len(display_text) > 80:
+                    display_text = display_text[:77] + "..."
+                lines.append(f"  {uid}   {display_text}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    name="get_journaling_by_date",
+    description="""Get journal entries from Daily Notes for a specific date.
+
+Parameters:
+- when: Date string in ISO8601/RFC2822/RFC3339 format. Optional, defaults to today.
+
+Returns: Journal content as formatted text.
+
+Example: get_journaling_by_date(when="2024-01-15") or get_journaling_by_date()
+"""
 )
 async def get_journaling_by_date(when=None):
     if not when:

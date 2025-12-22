@@ -4,10 +4,23 @@ build-backend = "hatchling.build"
 
 [project]
 name = "roamresearch-client-py"
-version = "0.1.0"
-description = "Default template for PDM package"
+version = "0.2.0"
+description = "Roam Research Python client with built-in CLI and MCP server support."
 authors = [
     {name = "Leechael Yim", email = "yanleech@gmail.com"},
+]
+keywords = ["roam", "roamresearch", "mcp", "cli", "note-taking", "knowledge-graph"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
     "fastapi>=0.115.12",
@@ -22,6 +35,11 @@ dependencies = [
 requires-python = ">=3.10"
 readme = "README.md"
 license = {text = "MIT"}
+
+[project.urls]
+Homepage = "https://github.com/Leechael/roamresearch-client-py"
+Repository = "https://github.com/Leechael/roamresearch-client-py"
+Issues = "https://github.com/Leechael/roamresearch-client-py/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -39,6 +57,7 @@ packages = ["src/roamresearch_client_py"]
 include = [
     "src/roamresearch_client_py",
     "README.md",
+    "LICENSE",
     "pyproject.toml",
 ]
 

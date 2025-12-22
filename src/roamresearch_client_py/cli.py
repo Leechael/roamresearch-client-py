@@ -1,11 +1,16 @@
 import argparse
 import asyncio
+import json
 import os
+import sys
 from typing import Sequence
 
 from . import __version__
-from .config import init_config_file, CONFIG_FILE
+from .config import init_config_file, CONFIG_FILE, configure_logging
 from .server import serve
+from .client import RoamClient, create_page
+from .gfm_to_roam import gfm_to_batch_actions
+from .formatter import format_block_as_markdown
 
 
 def _run_async(coro):
@@ -63,10 +68,95 @@ def build_parser():
         help="Overwrite existing configuration file.",
     )
 
+    # save command
+    save_cmd = subcommands.add_parser(
+        "save",
+        help="Save markdown to Roam Research.",
+        description="Save a markdown file or stdin content to Roam Research as a new page.",
+    )
+    save_cmd.add_argument(
+        "--title",
+        "-t",
+        required=True,
+        help="Title of the page to create.",
+    )
+    save_cmd.add_argument(
+        "--file",
+        "-f",
+        help="Markdown file to save. If not provided, reads from stdin.",
+    )
+
+    # get command (supports both page title and uid)
+    get_cmd = subcommands.add_parser(
+        "get",
+        help="Read a page or block and output as markdown.",
+        description="Fetch a page by title or block by uid and output its content as GFM markdown.",
+    )
+    get_cmd.add_argument(
+        "identifier",
+        help="Page title or block uid (accepts ((uid)) format).",
+    )
+    get_cmd.add_argument(
+        "--debug",
+        action="store_true",
+        help="Output raw JSON data instead of markdown.",
+    )
+
+    # search command
+    search_cmd = subcommands.add_parser(
+        "search",
+        help="Search blocks containing text.",
+        description="Search for blocks containing all given terms.",
+    )
+    search_cmd.add_argument(
+        "terms",
+        nargs='+',
+        help="Search terms (all must match).",
+    )
+    search_cmd.add_argument(
+        "--page",
+        "-p",
+        help="Limit search to a specific page title.",
+    )
+    search_cmd.add_argument(
+        "--ignore-case",
+        "-i",
+        action="store_true",
+        help="Case-insensitive search.",
+    )
+    search_cmd.add_argument(
+        "--limit",
+        "-n",
+        type=int,
+        default=20,
+        help="Maximum number of results (default: 20).",
+    )
+
+    # q command - raw datalog query
+    q_cmd = subcommands.add_parser(
+        "q",
+        help="Execute a raw datalog query.",
+        description="Execute a raw datalog query for debugging. Query can be provided as argument or via stdin.",
+    )
+    q_cmd.add_argument(
+        "query",
+        nargs='?',
+        help="Datalog query string. If not provided, reads from stdin.",
+    )
+    q_cmd.add_argument(
+        "--args",
+        "-a",
+        nargs='*',
+        help="Query arguments (optional).",
+    )
+
     return parser
 
 
 def main(argv: Sequence[str] | None = None):
+    # Configure logging early to suppress httpx INFO logs
+    configure_logging()
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -90,6 +180,170 @@ def main(argv: Sequence[str] | None = None):
             os.environ["ROAM_STORAGE_DIR"] = args.debug_storage
         _run_async(serve(port=args.port))
         return
+
+    if args.command == "save":
+        _run_async(_save_markdown(args.title, args.file))
+        return
+
+    if args.command == "get":
+        _run_async(_get(args.identifier, args.debug))
+        return
+
+    if args.command == "search":
+        _run_async(_search_blocks(
+            args.terms,
+            args.limit,
+            case_sensitive=not args.ignore_case,
+            page_title=args.page
+        ))
+        return
+
+    if args.command == "q":
+        _run_async(_query(args.query, args.args))
+        return
+
+
+async def _save_markdown(title: str, file_path: str | None):
+    """Save markdown content to Roam as a new page."""
+    if file_path:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            markdown = f.read()
+    else:
+        markdown = sys.stdin.read()
+
+    if not markdown.strip():
+        print("Error: No content provided.", file=sys.stderr)
+        return
+
+    page = create_page(title)
+    page_uid = page['page']['uid']
+    actions = [page] + gfm_to_batch_actions(markdown, page_uid)
+
+    async with RoamClient() as client:
+        await client.batch_actions(actions)
+
+    print(f"Saved page: {title}")
+
+
+def _parse_uid(identifier: str) -> str | None:
+    """
+    Parse uid from ((uid)) or uid format.
+    Returns None if identifier looks like a page title.
+    """
+    identifier = identifier.strip()
+
+    # Wrapped in (()) - definitely a uid
+    if identifier.startswith('((') and identifier.endswith('))'):
+        return identifier[2:-2]
+
+    # Contains spaces or CJK characters - likely a page title
+    if ' ' in identifier or any('\u4e00' <= c <= '\u9fff' for c in identifier):
+        return None
+
+    # Short alphanumeric with possible - and _ could be uid
+    # Roam uids are typically 9 chars or 32 hex chars
+    if len(identifier) <= 40 and all(c.isalnum() or c in '-_' for c in identifier):
+        return identifier
+
+    return None
+
+
+async def _get(identifier: str, debug: bool = False):
+    """Read a page or block and output as markdown."""
+    uid = _parse_uid(identifier)
+
+    async with RoamClient() as client:
+        result = None
+        is_page = False
+
+        # Try as uid first if it looks like one
+        if uid:
+            result = await client.get_block_by_uid(uid)
+
+        # If not found or doesn't look like uid, try as page title
+        if not result:
+            result = await client.get_page_by_title(identifier)
+            is_page = True
+
+    if not result:
+        print(f"Error: '{identifier}' not found.", file=sys.stderr)
+        return
+
+    if debug:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    # Get children
+    children = result.get(':block/children', [])
+    if children:
+        children = sorted(children, key=lambda x: x.get(':block/order', 0))
+
+    if is_page:
+        # For pages, format children directly
+        output = format_block_as_markdown(children)
+    else:
+        # For blocks, include the block itself
+        output = format_block_as_markdown([result])
+
+    print(output)
+
+
+async def _search_blocks(
+    terms: list[str],
+    limit: int,
+    case_sensitive: bool = True,
+    page_title: str | None = None
+):
+    """Search blocks and output results grouped by page."""
+    async with RoamClient() as client:
+        results = await client.search_blocks(
+            terms,
+            limit,
+            case_sensitive=case_sensitive,
+            page_title=page_title
+        )
+
+    if not results:
+        print("No results found.")
+        return
+
+    # Group results by page (preserving sort order from client)
+    by_page: dict[str, list[tuple[str, str]]] = {}
+    page_order: list[str] = []
+    for item in results:
+        uid, text, page = item[0], item[1], item[2]
+        if page not in by_page:
+            by_page[page] = []
+            page_order.append(page)
+        by_page[page].append((uid, text))
+
+    # Output grouped by page
+    for page in page_order:
+        blocks = by_page[page]
+        print(f"[[{page}]]")
+        for uid, text in blocks:
+            display_text = text.replace('\n', ' ')
+            if len(display_text) > 60:
+                display_text = display_text[:57] + "..."
+            print(f"  {uid}   {display_text}")
+        print()
+
+
+async def _query(query: str | None, args: list[str] | None):
+    """Execute a raw datalog query."""
+    if query:
+        q = query
+    else:
+        q = sys.stdin.read()
+
+    if not q.strip():
+        print("Error: No query provided.", file=sys.stderr)
+        return
+
+    async with RoamClient() as client:
+        result = await client.q(q, args)
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -135,8 +135,16 @@ class Block:
 
 
 class RoamClient(object):
+    _logging_configured = False
+
     def __init__(self, api_token: str | None = None, graph: str | None = None):
-        from .config import get_env_or_config
+        from .config import get_env_or_config, configure_logging
+
+        # Configure logging once on first client instantiation
+        if not RoamClient._logging_configured:
+            configure_logging()
+            RoamClient._logging_configured = True
+
         if api_token is None:
             api_token = get_env_or_config("ROAM_API_TOKEN", "roam.api_token")
         if graph is None:
@@ -252,3 +260,113 @@ class RoamClient(object):
             now = pendulum.now()
             parent_uid = f"{now.month:02d}-{now.day:02d}-{now.year}"
         return Block(text, parent_uid, open, client=self)
+
+    async def get_page_by_title(self, title: str):
+        """Get a page and all its children by title."""
+        # Escape quotes in title
+        escaped_title = title.replace('"', '\\"')
+        query = f'''
+[:find (pull ?e [*
+                 {{:block/children ...}}
+                 {{:block/refs [*]}}
+                ])
+ :where [?e :node/title "{escaped_title}"]]
+'''
+        resp = await self.q(query)
+        return resp[0][0] if resp else None
+
+    async def search_blocks(
+        self,
+        terms: list[str],
+        limit: int = 20,
+        case_sensitive: bool = True,
+        page_title: str | None = None
+    ):
+        """
+        Search blocks containing all given terms.
+
+        Args:
+            terms: List of search terms (all must match)
+            limit: Maximum number of results
+            case_sensitive: Whether to match case
+            page_title: Optional page title to scope the search
+
+        Returns:
+            List of [block_uid, block_string, page_title] tuples, sorted by relevance:
+            - Priority 0: Page title exactly matches a search term
+            - Priority 1: Block contains [[term]] or #[[term]]
+            - Priority 2: Partial match
+        """
+        # Build conditions for each term
+        conditions = []
+        for term in terms:
+            escaped = term.replace('"', '\\"')
+            if case_sensitive:
+                conditions.append(f'[(clojure.string/includes? ?s "{escaped}")]')
+            else:
+                conditions.append(f'[(clojure.string/includes? (clojure.string/lower-case ?s) "{escaped.lower()}")]')
+
+        term_conditions = '\n    '.join(conditions)
+
+        if page_title:
+            # Search within specific page
+            escaped_title = page_title.replace('"', '\\"')
+            query = f'''
+[:find ?uid ?s
+ :where
+    [?p :node/title "{escaped_title}"]
+    [?b :block/page ?p]
+    [?b :block/string ?s]
+    [?b :block/uid ?uid]
+    {term_conditions}]
+'''
+            resp = await self.q(query)
+            # Add page_title to results
+            results = [[uid, s, page_title] for uid, s in resp] if resp else []
+        else:
+            # Global search with page title
+            query = f'''
+[:find ?uid ?s ?page-title
+ :where
+    [?b :block/string ?s]
+    [?b :block/uid ?uid]
+    [?b :block/page ?p]
+    [?p :node/title ?page-title]
+    {term_conditions}]
+'''
+            resp = await self.q(query)
+            results = list(resp) if resp else []
+
+        # Sort by relevance
+        def sort_key(item):
+            uid, text, page = item[0], item[1], item[2]
+            for term in terms:
+                term_check = term if case_sensitive else term.lower()
+                page_check = page if case_sensitive else page.lower()
+                text_check = text if case_sensitive else text.lower()
+
+                # Priority 0: Page title exactly matches
+                if page_check == term_check:
+                    return (0, page)
+
+                # Priority 1: Contains [[term]] or #[[term]]
+                if f'[[{term_check}]]' in text_check or f'#[[{term_check}]]' in text_check:
+                    return (1, page)
+
+            # Priority 2: Partial match
+            return (2, page)
+
+        results.sort(key=sort_key)
+        return results[:limit]
+
+    async def get_block_by_uid(self, uid: str):
+        """Get a block and all its children by uid."""
+        query = f'''
+[:find (pull ?e [*
+                 {{:block/children ...}}
+                 {{:block/refs [*]}}
+                ])
+ :where [?e :block/uid "{uid}"]]
+'''
+        resp = await self.q(query)
+        return resp[0][0] if resp else None
