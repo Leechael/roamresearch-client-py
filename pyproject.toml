@@ -61,5 +61,13 @@ include = [
     "pyproject.toml",
 ]
 
+[tool.pdm.build]
+includes = ["src/roamresearch_client_py"]
+package-dir = "src"
+
+[[tool.pdm.resolution.targets]]
+# Cross-platform lock file - no platform constraints
+python = ">=3.10"
+
 [tool.pdm.scripts]
-start = "python -m src.roamresearch_client_py.cli mcp"
+start = "python -m roamresearch_client_py.cli mcp"
