@@ -68,6 +68,18 @@ def remove_block(uid):
     }
 
 
+def move_block(uid: str, parent_uid: str, order: int | str = "last"):
+    """Generate move-block action for batch operations."""
+    return {
+        "action": "move-block",
+        "block": {"uid": uid},
+        "location": {
+            "parent-uid": parent_uid,
+            "order": order
+        }
+    }
+
+
 class Block:
     def __init__(
             self,
@@ -370,3 +382,113 @@ class RoamClient(object):
 '''
         resp = await self.q(query)
         return resp[0][0] if resp else None
+
+    async def update_block_text(
+        self,
+        uid: str,
+        text: str,
+        dry_run: bool = False
+    ) -> dict:
+        """
+        Update a single block's text (does not process children).
+
+        Args:
+            uid: Block UID to update
+            text: New text content
+            dry_run: If True, return the action without executing
+
+        Returns:
+            dict with 'actions' and 'stats'
+
+        Raises:
+            ValueError: If block not found
+        """
+        # Verify block exists
+        existing = await self.get_block_by_uid(uid)
+        if not existing:
+            raise ValueError(f"Block not found: {uid}")
+
+        action = {
+            "action": "update-block",
+            "block": {
+                "uid": uid,
+                "string": text
+            }
+        }
+
+        result = {
+            'actions': [action],
+            'stats': {'updates': 1, 'creates': 0, 'moves': 0, 'deletes': 0}
+        }
+
+        if not dry_run:
+            await self.batch_actions([action])
+
+        return result
+
+    async def update_page_markdown(
+        self,
+        title: str,
+        markdown: str,
+        dry_run: bool = False
+    ) -> dict:
+        """
+        Update an existing page with new markdown content using smart diff.
+
+        This method:
+        1. Fetches the existing page content
+        2. Converts new markdown to blocks
+        3. Computes minimal diff (preserving UIDs where possible)
+        4. Executes the diff actions
+
+        Args:
+            title: Page title to update
+            markdown: New GFM markdown content
+            dry_run: If True, return actions without executing
+
+        Returns:
+            dict with:
+                - 'actions': list of executed actions
+                - 'stats': counts of creates, updates, moves, deletes
+                - 'preserved_uids': set of UIDs that were reused
+
+        Raises:
+            ValueError: If page not found or markdown is empty
+        """
+        from .diff import parse_existing_blocks, diff_block_trees, generate_batch_actions
+        from .gfm_to_roam import gfm_to_blocks
+
+        if not markdown.strip():
+            raise ValueError("Cannot update with empty content")
+
+        # Fetch existing page
+        page = await self.get_page_by_title(title)
+        if not page:
+            raise ValueError(f"Page not found: {title}")
+
+        page_uid = page.get(':block/uid')
+        if not page_uid:
+            raise ValueError(f"Page has no UID: {title}")
+
+        # Parse existing blocks
+        existing_blocks = parse_existing_blocks(page)
+
+        # Convert new markdown to blocks
+        new_blocks = gfm_to_blocks(markdown, page_uid)
+
+        # Compute diff
+        diff = diff_block_trees(existing_blocks, new_blocks, page_uid)
+
+        # Generate ordered actions
+        actions = generate_batch_actions(diff)
+
+        result = {
+            'actions': actions,
+            'stats': diff.stats(),
+            'preserved_uids': list(diff.preserved_uids)
+        }
+
+        if not dry_run and actions:
+            await self.batch_actions(actions)
+
+        return result
