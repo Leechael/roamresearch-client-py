@@ -132,6 +132,24 @@ def build_parser():
         help="Maximum number of results (default: 20).",
     )
 
+    # q command - raw datalog query
+    q_cmd = subcommands.add_parser(
+        "q",
+        help="Execute a raw datalog query.",
+        description="Execute a raw datalog query for debugging. Query can be provided as argument or via stdin.",
+    )
+    q_cmd.add_argument(
+        "query",
+        nargs='?',
+        help="Datalog query string. If not provided, reads from stdin.",
+    )
+    q_cmd.add_argument(
+        "--args",
+        "-a",
+        nargs='*',
+        help="Query arguments (optional).",
+    )
+
     return parser
 
 
@@ -175,6 +193,10 @@ def main(argv: Sequence[str] | None = None):
             case_sensitive=not args.ignore_case,
             page_title=args.page
         ))
+        return
+
+    if args.command == "q":
+        _run_async(_query(args.query, args.args))
         return
 
 
@@ -302,6 +324,23 @@ async def _search_blocks(
                 display_text = display_text[:57] + "..."
             print(f"  {uid}   {display_text}")
         print()
+
+
+async def _query(query: str | None, args: list[str] | None):
+    """Execute a raw datalog query."""
+    if query:
+        q = query
+    else:
+        q = sys.stdin.read()
+
+    if not q.strip():
+        print("Error: No query provided.", file=sys.stderr)
+        return
+
+    async with RoamClient() as client:
+        result = await client.q(q, args)
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
