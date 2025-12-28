@@ -252,7 +252,6 @@ def diff_block_trees(
 
     # Build desired structure based on markdown parent_refs, but translate UIDs
     # through `matches` so "new" parents that are preserved are addressed correctly.
-    new_uid_to_target_uid: dict[str, str] = {}
     new_uid_to_desired_parent: dict[str, str] = {}
     siblings_by_desired_parent: dict[str, list[str]] = defaultdict(list)
 
@@ -260,7 +259,6 @@ def diff_block_trees(
         new_uid = new_block.ref.block_uid
         target_uid = matches.get(new_uid, new_uid)  # preserved existing UID or new UID
         dparent = desired_parent_uid(new_block)
-        new_uid_to_target_uid[new_uid] = target_uid
         new_uid_to_desired_parent[new_uid] = dparent
         siblings_by_desired_parent[dparent].append(target_uid)
 
