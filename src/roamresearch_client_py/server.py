@@ -10,6 +10,7 @@ from pathlib import Path
 import traceback
 import sqlite3
 from datetime import datetime
+import json
 
 from dotenv import load_dotenv
 import mcp.types as types
@@ -149,7 +150,7 @@ def update_task(task_id: str, status: str = None, processed_blocks: int = None, 
     updates.append('updated_at = ?')
     params.append(datetime.now().isoformat())
 
-    if status in ('completed', 'failed'):
+    if status in ('completed', 'failed', 'completed_with_warnings'):
         updates.append('completed_at = ?')
         params.append(datetime.now().isoformat())
 
@@ -172,6 +173,38 @@ def get_task(task_id: str):
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def _task_debug_log_path(task_id: str) -> Path | None:
+    storage_dir = get_env_or_config("ROAM_STORAGE_DIR", "storage.dir")
+    if not storage_dir:
+        return None
+    # Keep task JSONL logs in a dedicated subdirectory to avoid mixing with
+    # markdown debug dumps and other artifacts.
+    directory = Path(str(storage_dir)) / "task_logs"
+    directory.mkdir(parents=True, exist_ok=True)
+    dt = pendulum.now().format("YYYYMMDD")
+    return directory / f"{dt}_task_{task_id}.jsonl"
+
+
+def _append_task_event(task_id: str, event: str, payload: dict):
+    """
+    Append a structured event record to a per-task debug log file.
+
+    This is intentionally file-based (not SQLite) to avoid migrations and to keep
+    large payloads (actions / responses) out of the task table.
+    """
+    path = _task_debug_log_path(task_id)
+    if not path:
+        return
+    record = {
+        "ts": pendulum.now().to_iso8601_string(),
+        "task_id": task_id,
+        "event": event,
+        "payload": payload,
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def get_when(when = None):
@@ -266,6 +299,11 @@ async def _process_update_actions_background(task_id: str, actions: list):
 
     logger.info(f"Task {task_id}: Processing {total_actions} update actions in batches of {batch_size}")
     update_task(task_id, status='processing')
+    _append_task_event(
+        task_id,
+        "update_started",
+        {"total_actions": total_actions, "batch_size": batch_size, "max_retries": max_retries},
+    )
 
     async with RoamClient() as client:
         for i in range(0, total_actions, batch_size):
@@ -274,13 +312,32 @@ async def _process_update_actions_background(task_id: str, actions: list):
             total_batches = (total_actions + batch_size - 1) // batch_size
 
             logger.info(f"Task {task_id}: Processing batch {batch_num}/{total_batches} ({len(batch)} actions)")
+            _append_task_event(
+                task_id,
+                "batch_start",
+                {
+                    "batch_num": batch_num,
+                    "total_batches": total_batches,
+                    "actions_in_batch": len(batch),
+                },
+            )
 
             retry_count = 0
             last_error = None
 
             while retry_count <= max_retries:
                 try:
-                    await client.batch_actions(batch)
+                    resp = await client.batch_actions(batch)
+                    logger.info(f"Task {task_id}: Batch {batch_num}/{total_batches} response: {resp}")
+                    _append_task_event(
+                        task_id,
+                        "batch_ok",
+                        {
+                            "batch_num": batch_num,
+                            "total_batches": total_batches,
+                            "response": resp if isinstance(resp, dict) else {"_raw": str(resp)},
+                        },
+                    )
                     processed += len(batch)
                     update_task(task_id, processed_blocks=processed)
                     logger.info(f"Task {task_id}: Batch {batch_num}/{total_batches} completed. Progress: {processed}/{total_actions}")
@@ -291,15 +348,96 @@ async def _process_update_actions_background(task_id: str, actions: list):
                     if retry_count <= max_retries:
                         wait_time = 2 ** retry_count
                         logger.warning(f"Task {task_id}: Batch {batch_num} failed (attempt {retry_count}/{max_retries}), retrying in {wait_time}s: {e}")
+                        _append_task_event(
+                            task_id,
+                            "batch_retry",
+                            {
+                                "batch_num": batch_num,
+                                "attempt": retry_count,
+                                "max_retries": max_retries,
+                                "error": last_error,
+                            },
+                        )
                         await asyncio.sleep(wait_time)
                     else:
                         error_msg = f"Batch {batch_num} failed after {max_retries} retries: {last_error}"
                         logger.error(f"Task {task_id}: {error_msg}")
+                        _append_task_event(
+                            task_id,
+                            "batch_failed",
+                            {
+                                "batch_num": batch_num,
+                                "total_batches": total_batches,
+                                "error": error_msg,
+                                "note": "Roam batch-actions is not transactional; earlier actions in this batch may already be applied.",
+                                "actions": batch,
+                            },
+                        )
                         update_task(task_id, status='failed', error_message=error_msg, processed_blocks=processed)
                         return
 
-    update_task(task_id, status='completed', processed_blocks=processed)
-    logger.info(f"Task {task_id}: All {total_actions} actions processed successfully")
+        # Verification phase: fetch page and confirm diff is empty.
+        task = get_task(task_id)
+        if not task:
+            msg = "Task record not found for verification"
+            logger.warning(f"Task {task_id}: {msg}")
+            _append_task_event(task_id, "verify_skipped", {"reason": msg})
+            update_task(task_id, status='completed_with_warnings', processed_blocks=processed, error_message=msg)
+            return
+
+        page_uid = task.get("page_uid")
+        markdown = task.get("markdown") or ""
+        if not page_uid:
+            msg = "Missing page_uid for verification"
+            logger.warning(f"Task {task_id}: {msg}")
+            _append_task_event(task_id, "verify_skipped", {"reason": msg})
+            update_task(task_id, status='completed_with_warnings', processed_blocks=processed, error_message=msg)
+            return
+
+        update_task(task_id, status="verifying", processed_blocks=processed)
+        _append_task_event(task_id, "verify_start", {"page_uid": page_uid})
+
+        try:
+            page = await client.get_block_by_uid(page_uid)
+            if not page:
+                raise ValueError(f"Page UID not found after update: {page_uid}")
+
+            from .verify import diff_page_against_markdown
+
+            verify_diff = diff_page_against_markdown(page, markdown)
+            verify_stats = verify_diff.stats()
+            _append_task_event(task_id, "verify_result", {"stats": verify_stats})
+
+            if verify_diff.is_empty():
+                update_task(task_id, status='completed', processed_blocks=processed)
+                logger.info(f"Task {task_id}: All {total_actions} actions processed successfully; verification OK")
+                return
+
+            warn_msg = (
+                "Verification diff is not empty after update: "
+                f"{verify_stats['creates']} creates, {verify_stats['updates']} updates, "
+                f"{verify_stats['moves']} moves, {verify_stats['deletes']} deletes"
+            )
+            _append_task_event(
+                task_id,
+                "verify_warning",
+                {
+                    "message": warn_msg,
+                    "stats": verify_stats,
+                    "suggested_actions_preview": generate_batch_actions(verify_diff)[:50],
+                    "note": "Non-empty diff may indicate partial application or unexpected Roam behavior; consider re-running update or inspecting task log.",
+                },
+            )
+            update_task(task_id, status="completed_with_warnings", processed_blocks=processed, error_message=warn_msg)
+            logger.warning(f"Task {task_id}: {warn_msg}")
+            return
+
+        except Exception as e:
+            err = f"Verification failed: {e}"
+            _append_task_event(task_id, "verify_error", {"error": err})
+            update_task(task_id, status="completed_with_warnings", processed_blocks=processed, error_message=err)
+            logger.warning(f"Task {task_id}: {err}")
+            return
 
 
 async def get_topic_uid(client, topic: str, when: pendulum.DateTime):

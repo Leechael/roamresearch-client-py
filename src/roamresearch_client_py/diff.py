@@ -229,29 +229,38 @@ def diff_block_trees(
     # Step 1: Match blocks by content
     matches = match_blocks(existing_flat, new_blocks)
 
-    # Build reverse mapping: existing_uid -> new_block
-    existing_to_new: dict[str, 'Block'] = {}
-    for new_uid, exist_uid in matches.items():
-        for nb in new_blocks:
-            if nb.ref.block_uid == new_uid:
-                existing_to_new[exist_uid] = nb
-                break
-
     # Build existing uid -> ExistingBlock mapping
     existing_by_uid = {eb.uid: eb for eb in existing_flat}
 
-    # Group matched new blocks by their EXISTING parent (preserve structure)
-    # Key: existing parent_uid, Value: list of (new_block, exist_uid) in markdown order
-    matched_by_existing_parent: dict[str, list[tuple['Block', str]]] = {}
+    def desired_parent_uid(new_block: 'Block') -> str:
+        """
+        Resolve the desired parent UID for a new block.
+
+        The markdown-to-blocks step produces a tree using *new* UIDs. When a parent
+        block is matched to an existing Roam block, children must target the
+        *existing* parent UID; otherwise create/move can reference a non-existent UID.
+        """
+        if new_block.parent_ref is None or not new_block.parent_ref.is_valid():
+            return parent_uid
+
+        parent_new_uid = new_block.parent_ref.block_uid
+        if parent_new_uid == parent_uid:
+            return parent_uid
+
+        # If parent itself is matched, target the existing parent UID.
+        return matches.get(parent_new_uid, parent_new_uid)
+
+    # Build desired structure based on markdown parent_refs, but translate UIDs
+    # through `matches` so "new" parents that are preserved are addressed correctly.
+    new_uid_to_desired_parent: dict[str, str] = {}
+    siblings_by_desired_parent: dict[str, list[str]] = defaultdict(list)
+
     for new_block in new_blocks:
         new_uid = new_block.ref.block_uid
-        if new_uid in matches:
-            exist_uid = matches[new_uid]
-            exist_block = existing_by_uid[exist_uid]
-            exist_parent = exist_block.parent_uid or parent_uid
-            if exist_parent not in matched_by_existing_parent:
-                matched_by_existing_parent[exist_parent] = []
-            matched_by_existing_parent[exist_parent].append((new_block, exist_uid))
+        target_uid = matches.get(new_uid, new_uid)  # preserved existing UID or new UID
+        dparent = desired_parent_uid(new_block)
+        new_uid_to_desired_parent[new_uid] = dparent
+        siblings_by_desired_parent[dparent].append(target_uid)
 
     # Step 2: Process matched blocks (check for updates/moves)
     for new_block in new_blocks:
@@ -260,7 +269,8 @@ def diff_block_trees(
         if new_uid in matches:
             exist_uid = matches[new_uid]
             exist_block = existing_by_uid[exist_uid]
-            exist_parent = exist_block.parent_uid or parent_uid
+            current_parent = exist_block.parent_uid or parent_uid
+            dparent = new_uid_to_desired_parent[new_uid]
             result.preserved_uids.add(exist_uid)
 
             # Check for text/heading changes -> update-block
@@ -287,33 +297,27 @@ def diff_block_trees(
             if needs_update:
                 result.updates.append(update_action)
 
-            # Check for order changes within SAME parent -> move-block
-            # Calculate expected order: position in markdown among siblings with same existing parent
-            siblings = matched_by_existing_parent.get(exist_parent, [])
-            expected_order = next(
-                (i for i, (nb, _) in enumerate(siblings) if nb.ref.block_uid == new_uid),
-                exist_block.order
-            )
-
-            # Only move if order changed (parent stays the same)
-            if exist_block.order != expected_order:
-                result.moves.append({
-                    "action": "move-block",
-                    "block": {"uid": exist_uid},
-                    "location": {
-                        "parent-uid": exist_parent,
-                        "order": expected_order
+            # Check for parent/order changes -> move-block
+            desired_siblings = siblings_by_desired_parent.get(dparent, [])
+            desired_order = desired_siblings.index(exist_uid) if exist_uid in desired_siblings else exist_block.order
+            if current_parent != dparent or exist_block.order != desired_order:
+                result.moves.append(
+                    {
+                        "action": "move-block",
+                        "block": {"uid": exist_uid},
+                        "location": {"parent-uid": dparent, "order": desired_order},
                     }
-                })
+                )
         else:
             # No match -> create-block
-            # For new blocks, use the page as parent (simple approach)
-            # TODO: Could try to find appropriate parent based on markdown structure
+            dparent = new_uid_to_desired_parent[new_uid]
+            desired_siblings = siblings_by_desired_parent.get(dparent, [])
+            desired_order = desired_siblings.index(new_uid) if new_uid in desired_siblings else "last"
             create_action = {
                 "action": "create-block",
                 "location": {
-                    "parent-uid": parent_uid,
-                    "order": "last"
+                    "parent-uid": dparent,
+                    "order": desired_order
                 },
                 "block": {
                     "uid": new_block.ref.block_uid,
@@ -348,10 +352,10 @@ def generate_batch_actions(diff: DiffResult) -> list[dict]:
     Convert DiffResult to ordered batch actions for Roam API.
 
     Order of operations:
-    1. Deletes (bottom-up to avoid orphan issues)
-    2. Moves (reposition existing blocks)
-    3. Creates (top-down to ensure parents exist)
-    4. Updates (order doesn't matter)
+    1. Creates (top-down to ensure parents exist)
+    2. Moves (reposition existing blocks / reparent)
+    3. Updates (string/heading tweaks)
+    4. Deletes (bottom-up; delete is recursive so do it last)
 
     Args:
         diff: The DiffResult to convert
@@ -361,16 +365,16 @@ def generate_batch_actions(diff: DiffResult) -> list[dict]:
     """
     actions = []
 
-    # 1. Deletes first (reverse order to delete children before parents)
-    actions.extend(reversed(diff.deletes))
+    # 1. Creates (in markdown order, so parents before children)
+    actions.extend(diff.creates)
 
     # 2. Moves
     actions.extend(diff.moves)
 
-    # 3. Creates (in order, so parents before children)
-    actions.extend(diff.creates)
-
-    # 4. Updates last
+    # 3. Updates
     actions.extend(diff.updates)
+
+    # 4. Deletes last (reverse order to delete children before parents)
+    actions.extend(reversed(diff.deletes))
 
     return actions
