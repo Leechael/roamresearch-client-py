@@ -71,8 +71,8 @@ def build_parser():
     # save command
     save_cmd = subcommands.add_parser(
         "save",
-        help="Save markdown to Roam Research.",
-        description="Save a markdown file or stdin content to Roam Research as a new page.",
+        help="Save markdown to Roam Research (create or update).",
+        description="Save markdown to Roam Research. Creates a new page or updates existing.",
     )
     save_cmd.add_argument(
         "--title",
@@ -105,13 +105,18 @@ def build_parser():
     # search command
     search_cmd = subcommands.add_parser(
         "search",
-        help="Search blocks containing text.",
-        description="Search for blocks containing all given terms.",
+        help="Search blocks containing text or tags.",
+        description="Search for blocks containing all given terms, optionally filtered by tag.",
     )
     search_cmd.add_argument(
         "terms",
-        nargs='+',
-        help="Search terms (all must match).",
+        nargs='*',
+        help="Search terms (all must match). Optional if --tag is provided.",
+    )
+    search_cmd.add_argument(
+        "--tag",
+        "-t",
+        help="Filter by tag (e.g., #TODO, [[Project]]).",
     )
     search_cmd.add_argument(
         "--page",
@@ -150,31 +155,46 @@ def build_parser():
         help="Query arguments (optional).",
     )
 
-    # update command
-    update_cmd = subcommands.add_parser(
-        "update",
-        help="Update an existing page or block with new markdown.",
-        description="Update page/block content, preserving block UIDs where possible.",
+    # refs command
+    refs_cmd = subcommands.add_parser(
+        "refs",
+        help="Find blocks referencing a page or block.",
+        description="Find all blocks that reference a given page or block.",
     )
-    update_cmd.add_argument(
+    refs_cmd.add_argument(
         "identifier",
-        help="Page title or block UID to update.",
+        help="Page title or block UID to find references to.",
     )
-    update_cmd.add_argument(
-        "--file",
-        "-f",
-        help="Markdown file with new content. If not provided, reads from stdin.",
-    )
-    update_cmd.add_argument(
-        "--dry-run",
+    refs_cmd.add_argument(
+        "--limit",
         "-n",
-        action="store_true",
-        help="Show what would be changed without making changes.",
+        type=int,
+        default=50,
+        help="Maximum number of results (default: 50).",
     )
-    update_cmd.add_argument(
-        "--force",
+
+    # todos command
+    todos_cmd = subcommands.add_parser(
+        "todos",
+        help="Search TODO/DONE items.",
+        description="Find TODO or DONE items in Roam.",
+    )
+    todos_cmd.add_argument(
+        "--done",
         action="store_true",
-        help="Update without confirmation prompt for deletes.",
+        help="Search for DONE items instead of TODO.",
+    )
+    todos_cmd.add_argument(
+        "--page",
+        "-p",
+        help="Limit search to a specific page title.",
+    )
+    todos_cmd.add_argument(
+        "--limit",
+        "-n",
+        type=int,
+        default=50,
+        help="Maximum number of results (default: 50).",
     )
 
     return parser
@@ -217,11 +237,14 @@ def main(argv: Sequence[str] | None = None):
         return
 
     if args.command == "search":
+        if not args.terms and not args.tag:
+            parser.error("search requires terms or --tag")
         _run_async(_search_blocks(
-            args.terms,
+            args.terms or [],
             args.limit,
             case_sensitive=not args.ignore_case,
-            page_title=args.page
+            page_title=args.page,
+            tag=args.tag
         ))
         return
 
@@ -229,13 +252,18 @@ def main(argv: Sequence[str] | None = None):
         _run_async(_query(args.query, args.args))
         return
 
-    if args.command == "update":
-        _run_async(_update(args.identifier, args.file, args.dry_run, args.force))
+    if args.command == "refs":
+        _run_async(_refs(args.identifier, args.limit))
+        return
+
+    if args.command == "todos":
+        status = "DONE" if args.done else "TODO"
+        _run_async(_todos(status, args.limit, args.page))
         return
 
 
 async def _save_markdown(title: str, file_path: str | None):
-    """Save markdown content to Roam as a new page."""
+    """Save markdown content to Roam, creating or updating as needed."""
     if file_path:
         with open(file_path, 'r', encoding='utf-8') as f:
             markdown = f.read()
@@ -246,14 +274,26 @@ async def _save_markdown(title: str, file_path: str | None):
         print("Error: No content provided.", file=sys.stderr)
         return
 
-    page = create_page(title)
-    page_uid = page['page']['uid']
-    actions = [page] + gfm_to_batch_actions(markdown, page_uid)
-
     async with RoamClient() as client:
-        await client.batch_actions(actions)
+        # Check if page exists
+        existing = await client.get_page_by_title(title)
 
-    print(f"Saved page: {title}")
+        if existing:
+            # Update existing page
+            result = await client.update_page_markdown(title, markdown)
+            stats = result['stats']
+            print(f"Updated page: {title}")
+            print(f"  {stats.get('creates', 0)} creates, "
+                  f"{stats.get('updates', 0)} updates, "
+                  f"{stats.get('moves', 0)} moves, "
+                  f"{stats.get('deletes', 0)} deletes")
+        else:
+            # Create new page
+            page = create_page(title)
+            page_uid = page['page']['uid']
+            actions = [page] + gfm_to_batch_actions(markdown, page_uid)
+            await client.batch_actions(actions)
+            print(f"Created page: {title}")
 
 
 def _parse_uid(identifier: str) -> str | None:
@@ -319,26 +359,8 @@ async def _get(identifier: str, debug: bool = False):
     print(output)
 
 
-async def _search_blocks(
-    terms: list[str],
-    limit: int,
-    case_sensitive: bool = True,
-    page_title: str | None = None
-):
-    """Search blocks and output results grouped by page."""
-    async with RoamClient() as client:
-        results = await client.search_blocks(
-            terms,
-            limit,
-            case_sensitive=case_sensitive,
-            page_title=page_title
-        )
-
-    if not results:
-        print("No results found.")
-        return
-
-    # Group results by page (preserving sort order from client)
+def _print_results_grouped(results: list):
+    """Print search results grouped by page."""
     by_page: dict[str, list[tuple[str, str]]] = {}
     page_order: list[str] = []
     for item in results:
@@ -348,7 +370,6 @@ async def _search_blocks(
             page_order.append(page)
         by_page[page].append((uid, text))
 
-    # Output grouped by page
     for page in page_order:
         blocks = by_page[page]
         print(f"[[{page}]]")
@@ -358,6 +379,39 @@ async def _search_blocks(
                 display_text = display_text[:57] + "..."
             print(f"  {uid}   {display_text}")
         print()
+
+
+async def _search_blocks(
+    terms: list[str],
+    limit: int,
+    case_sensitive: bool = True,
+    page_title: str | None = None,
+    tag: str | None = None
+):
+    """Search blocks and output results grouped by page."""
+    async with RoamClient() as client:
+        if terms:
+            # Text search (optionally with tag filter)
+            results = await client.search_blocks(
+                terms,
+                limit,
+                case_sensitive=case_sensitive,
+                page_title=page_title,
+                tag=tag
+            )
+        else:
+            # Tag-only search
+            results = await client.search_by_tag(
+                tag,
+                limit=limit,
+                page_title=page_title
+            )
+
+    if not results:
+        print("No results found.")
+        return
+
+    _print_results_grouped(results)
 
 
 async def _query(query: str | None, args: list[str] | None):
@@ -377,88 +431,51 @@ async def _query(query: str | None, args: list[str] | None):
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
-async def _update(identifier: str, file_path: str | None, dry_run: bool, force: bool):
-    """Update existing page/block with new markdown."""
-    # Read new content
-    stdin_used = False
-    if file_path:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            markdown = f.read()
-    else:
-        markdown = sys.stdin.read()
-        stdin_used = True
+async def _refs(identifier: str, limit: int):
+    """Find blocks referencing a page or block."""
+    identifier = identifier.strip()
 
-    if not markdown.strip():
-        print("Error: No content provided.", file=sys.stderr)
+    # Explicit ((uid)) format - definitely block reference
+    if identifier.startswith('((') and identifier.endswith('))'):
+        uid = identifier[2:-2]
+        async with RoamClient() as client:
+            results = await client.find_references(uid, limit=limit)
+        if not results:
+            print("No references found.")
+            return
+        _print_results_grouped(results)
         return
 
-    uid = _parse_uid(identifier)
-
-    try:
-        async with RoamClient() as client:
+    # Otherwise: try page refs first, fallback to block refs
+    async with RoamClient() as client:
+        results = await client.find_page_references(identifier, limit=limit)
+        if not results:
+            # Fallback: maybe it's a block UID
+            uid = _parse_uid(identifier)
             if uid:
-                # Single block update - just update text
-                result = await client.update_block_text(uid, markdown.strip(), dry_run=True)
-            else:
-                # Page update - smart diff
-                result = await client.update_page_markdown(identifier, markdown, dry_run=True)
+                results = await client.find_references(uid, limit=limit)
 
-        # Show preview
-        stats = result['stats']
-        print(f"Changes: {stats.get('creates', 0)} creates, "
-              f"{stats.get('updates', 0)} updates, "
-              f"{stats.get('moves', 0)} moves, "
-              f"{stats.get('deletes', 0)} deletes")
+    if not results:
+        print("No references found.")
+        return
 
-        if dry_run:
-            if result['actions']:
-                print("\nActions that would be taken:")
-                for action in result['actions']:
-                    action_type = action.get('action', 'unknown')
-                    block_uid = action.get('block', {}).get('uid', 'N/A')
-                    if action_type == 'create-block':
-                        text = action.get('block', {}).get('string', '')[:50]
-                        print(f"  + create: {text}...")
-                    elif action_type == 'update-block':
-                        text = action.get('block', {}).get('string', '')[:50]
-                        print(f"  ~ update {block_uid}: {text}...")
-                    elif action_type == 'move-block':
-                        order = action.get('location', {}).get('order', '?')
-                        print(f"  > move {block_uid} to order {order}")
-                    elif action_type == 'delete-block':
-                        print(f"  - delete {block_uid}")
-            else:
-                print("No changes needed.")
-            return
+    _print_results_grouped(results)
 
-        # Confirm if deletes and not forced
-        if not force and stats.get('deletes', 0) > 0:
-            if stdin_used:
-                # Cannot prompt for confirmation when stdin was used for content
-                print(f"Error: This will delete {stats['deletes']} block(s). "
-                      "Use --force to confirm when reading from stdin.", file=sys.stderr)
-                return
-            confirm = input(f"This will delete {stats['deletes']} block(s). Continue? [y/N] ")
-            if confirm.lower() != 'y':
-                print("Aborted.")
-                return
 
-        # Execute update
-        async with RoamClient() as client:
-            if uid:
-                await client.update_block_text(uid, markdown.strip())
-            else:
-                await client.update_page_markdown(identifier, markdown)
+async def _todos(status: str, limit: int, page_title: str | None = None):
+    """Search TODO/DONE items."""
+    async with RoamClient() as client:
+        results = await client.search_todos(
+            status=status,
+            limit=limit,
+            page_title=page_title
+        )
 
-        print("Updated successfully.")
+    if not results:
+        print(f"No {status} items found.")
+        return
 
-        if result.get('preserved_uids'):
-            print(f"Preserved {len(result['preserved_uids'])} block UID(s).")
-
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+    _print_results_grouped(results)
 
 
 if __name__ == "__main__":

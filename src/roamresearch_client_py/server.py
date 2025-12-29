@@ -440,17 +440,27 @@ async def _process_update_actions_background(task_id: str, actions: list):
             return
 
 
-async def get_topic_uid(client, topic: str, when: pendulum.DateTime):
+async def get_or_create_topic_uid(client, topic: str, when: pendulum.DateTime) -> str:
+    """Get topic node UID under daily page, creating it if not exists."""
+    daily_uid = when.format('MM-DD-YYYY')
+
+    # Query existing topic node
     block = await client.q(f"""
         [:find (pull ?id [:block/uid :node/title :block/string])
          :where [?id :block/string "{topic}"]
                 [?id :block/parents ?pid]
-                [?pid :block/uid "{when.format('MM-DD-YYYY')}"]
+                [?pid :block/uid "{daily_uid}"]
         ]
     """)
-    if not block:
-        raise ValueError(f"Topic node {topic} not found for {when.format('MM-DD-YYYY')}")
-    return block[0][0][':block/uid']
+
+    if block:
+        return block[0][0][':block/uid']
+
+    # Create topic node
+    topic_uid = uuid.uuid4().hex
+    await client.batch_actions([create_block(topic, daily_uid, topic_uid)])
+    logger.info(f"Created topic node '{topic}' under {daily_uid} with UID {topic_uid}")
+    return topic_uid
 
 #
 #
@@ -492,7 +502,7 @@ async def save_markdown(title: str, markdown: str) -> str:
 
         async with RoamClient() as client:
             if topic_node:
-                topic_uid = await get_topic_uid(client, topic_node, when)
+                topic_uid = await get_or_create_topic_uid(client, topic_node, when)
                 logger.info(f"Task {task_id}: Topic UID: {topic_uid}")
                 link_action = create_block(f"[[{title}]]", topic_uid, link_block_uid)
             else:
