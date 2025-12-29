@@ -70,4 +70,5 @@ package-dir = "src"
 python = ">=3.10"
 
 [tool.pdm.scripts]
-start = "python -m roamresearch_client_py.cli mcp"
+start = "python -m roamresearch_client_py.server"
+test = "pytest tests/"
