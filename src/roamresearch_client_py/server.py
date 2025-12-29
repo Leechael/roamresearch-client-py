@@ -591,6 +591,9 @@ async def handle_get(identifier: str | List[str], raw: bool = False, expand_refs
     # Normalize to list for batch processing
     identifiers = [identifier] if isinstance(identifier, str) else identifier
 
+    if not identifiers:
+        return "Error: No identifier provided"
+
     def collect_all_refs(block: dict, collected: set) -> set:
         """Recursively collect all ((uid)) refs from a block and its children."""
         text = block.get(':block/string', '')
