@@ -111,7 +111,7 @@ def build_tag_condition(tag: str) -> str:
     """
     Build a Datalog OR condition to match various tag formats.
 
-    Matches: [[tag]], #tag (followed by space/newline), #[[tag]]
+    Matches: [[tag]], #tag (followed by space/newline/end-of-string), #[[tag]]
 
     Args:
         tag: Normalized tag (without #, [[, ]])
@@ -123,7 +123,8 @@ def build_tag_condition(tag: str) -> str:
     return f'''(or (clojure.string/includes? ?s "[[{escaped}]]")
          (clojure.string/includes? ?s "#{escaped} ")
          (clojure.string/includes? ?s "#{escaped}\\n")
-         (clojure.string/includes? ?s "#[[{escaped}]]"))'''
+         (clojure.string/includes? ?s "#[[{escaped}]]")
+         (clojure.string/ends-with? ?s "#{escaped}"))'''
 
 
 def build_todo_pattern(status: str) -> str:
@@ -387,12 +388,8 @@ class RoamClient(object):
 
         # Add tag condition if specified
         if tag:
-            clean_tag = tag.replace('#', '').replace('[[', '').replace(']]', '').strip()
-            escaped_tag = clean_tag.replace('"', '\\"')
-            # Match [[tag]], #tag, or #[[tag]]
-            tag_condition = f'''[(or (clojure.string/includes? ?s "[[{escaped_tag}]]")
-         (clojure.string/includes? ?s "#{escaped_tag}")
-         (clojure.string/includes? ?s "#[[{escaped_tag}]]"))]'''
+            clean_tag = normalize_tag(tag)
+            tag_condition = f'[{build_tag_condition(clean_tag)}]'
             conditions.append(tag_condition)
 
         term_conditions = '\n    '.join(conditions)

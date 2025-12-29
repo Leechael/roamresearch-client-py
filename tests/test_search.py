@@ -69,6 +69,12 @@ class TestBuildTagCondition:
         assert '#TODO\\n' in condition
         assert '#[[TODO]]' in condition
 
+    def test_tag_at_end_of_string(self):
+        """Tags at end of string should match via ends-with."""
+        condition = build_tag_condition("TODO")
+        assert 'ends-with?' in condition
+        assert 'ends-with? ?s "#TODO"' in condition
+
     def test_tag_with_quotes_escaped(self):
         condition = build_tag_condition('say "hi"')
         assert '\\"' in condition
