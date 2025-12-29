@@ -96,6 +96,10 @@ jobs:
           python -m pip install -e ".[dev]"
           python -m pip install build
 
+      - name: Syntax check
+        run: |
+          python -m compileall -q .
+
       - name: Run tests
         run: |
           python -m pytest -q

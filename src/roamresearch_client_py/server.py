@@ -619,30 +619,44 @@ async def handle_get(identifier: str, raw: bool = False) -> str:
     description="""Search for blocks containing specified terms in Roam Research.
 
 Parameters:
-- terms: List of search terms. All terms must match (AND logic).
+- terms: List of search terms. All terms must match (AND logic). Can be empty if tag is specified.
+- tag: Filter results by tag (searches [[tag]], #tag, #[[tag]]). Optional.
 - page: Limit search to a specific page title. Optional.
 - case_sensitive: Case-sensitive matching. Default: true.
 - limit: Maximum results to return. Default: 20.
 
 Returns: Matching blocks grouped by page, showing UID and text preview.
 
-Example: search(terms=["python", "async"]) or search(terms=["todo"], page="Project Notes")
+Examples:
+- search(terms=["python", "async"]) - find blocks containing both terms
+- search(terms=[], tag="TODO") - find all blocks with #TODO tag
+- search(terms=["meeting"], tag="project") - find "meeting" in blocks tagged #project
 """
 )
 async def handle_search(
     terms: List[str],
+    tag: str | None = None,
     page: str | None = None,
     case_sensitive: bool = True,
     limit: int = 20
 ) -> str:
     try:
         async with RoamClient() as client:
-            results = await client.search_blocks(
-                terms,
-                limit,
-                case_sensitive=case_sensitive,
-                page_title=page
-            )
+            # If only tag is specified (no terms), use search_by_tag
+            if not terms and tag:
+                results = await client.search_by_tag(
+                    tag,
+                    limit,
+                    page_title=page
+                )
+            else:
+                results = await client.search_blocks(
+                    terms,
+                    limit,
+                    case_sensitive=case_sensitive,
+                    page_title=page,
+                    tag=tag
+                )
 
         if not results:
             return "No results found."
@@ -671,6 +685,130 @@ async def handle_search(
 
         return "\n".join(lines)
 
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    name="find_references",
+    description="""Find all blocks that reference a given page or block in Roam Research.
+
+Parameters:
+- identifier: Page title or block UID to find references to.
+  - For pages: finds all [[page]] and #page references
+  - For blocks: finds all ((uid)) block references
+
+Returns: List of referencing blocks grouped by page.
+
+Examples:
+- find_references(identifier="Project Notes") - find all links to [[Project Notes]]
+- find_references(identifier="abc123xyz") - find all ((abc123xyz)) block refs
+"""
+)
+async def handle_find_references(identifier: str, limit: int = 50) -> str:
+    uid = parse_uid(identifier)
+
+    try:
+        async with RoamClient() as client:
+            if uid:
+                # It's a block UID - find block references
+                results = await client.find_references(uid, limit)
+                ref_type = f"(({uid}))"
+            else:
+                # It's a page title - find page references
+                results = await client.find_page_references(identifier, limit)
+                ref_type = f"[[{identifier}]]"
+
+        if not results:
+            return f"No references found for {ref_type}"
+
+        # Group results by page
+        by_page: dict[str, list[tuple[str, str]]] = {}
+        page_order: list[str] = []
+        for item in results:
+            block_uid, text, page_title = item[0], item[1], item[2]
+            if page_title not in by_page:
+                by_page[page_title] = []
+                page_order.append(page_title)
+            by_page[page_title].append((block_uid, text))
+
+        # Format output
+        lines = [f"References to {ref_type}: {len(results)} found\n"]
+        for page_title in page_order:
+            blocks = by_page[page_title]
+            lines.append(f"[[{page_title}]]")
+            for block_uid, text in blocks:
+                display_text = text.replace('\n', ' ')
+                if len(display_text) > 80:
+                    display_text = display_text[:77] + "..."
+                lines.append(f"  {block_uid}   {display_text}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool(
+    name="search_todos",
+    description="""Search for TODO or DONE items in Roam Research.
+
+Parameters:
+- status: "TODO" or "DONE". Default: "TODO".
+- page: Limit search to a specific page title. Optional.
+- limit: Maximum results to return. Default: 50.
+
+Returns: List of TODO/DONE items grouped by page.
+
+Examples:
+- search_todos() - find all TODO items
+- search_todos(status="DONE") - find all completed items
+- search_todos(status="TODO", page="Project Notes") - find TODOs in specific page
+"""
+)
+async def handle_search_todos(
+    status: str = "TODO",
+    page: str | None = None,
+    limit: int = 50
+) -> str:
+    try:
+        async with RoamClient() as client:
+            results = await client.search_todos(
+                status=status,
+                limit=limit,
+                page_title=page
+            )
+
+        if not results:
+            return f"No {status} items found."
+
+        # Group results by page
+        by_page: dict[str, list[tuple[str, str]]] = {}
+        page_order: list[str] = []
+        for item in results:
+            uid, text, page_title = item[0], item[1], item[2]
+            if page_title not in by_page:
+                by_page[page_title] = []
+                page_order.append(page_title)
+            by_page[page_title].append((uid, text))
+
+        # Format output
+        lines = [f"{status} items: {len(results)} found\n"]
+        for page_title in page_order:
+            blocks = by_page[page_title]
+            lines.append(f"[[{page_title}]]")
+            for uid, text in blocks:
+                display_text = text.replace('\n', ' ')
+                if len(display_text) > 80:
+                    display_text = display_text[:77] + "..."
+                lines.append(f"  {uid}   {display_text}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except ValueError as e:
+        return f"Error: {e}"
     except Exception as e:
         return f"Error: {e}"
 
