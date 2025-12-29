@@ -80,6 +80,71 @@ def move_block(uid: str, parent_uid: str, order: int | str = "last"):
     }
 
 
+# ============================================================================
+# Query utilities (pure functions for testing)
+# ============================================================================
+
+def normalize_tag(tag: str) -> str:
+    """
+    Normalize a tag by removing #, [[, ]] syntax.
+
+    Examples:
+        normalize_tag("#TODO") -> "TODO"
+        normalize_tag("[[Project]]") -> "Project"
+        normalize_tag("#[[My Tag]]") -> "My Tag"
+    """
+    return tag.replace('#', '').replace('[[', '').replace(']]', '').strip()
+
+
+def escape_for_query(s: str) -> str:
+    """
+    Escape a string for use in Datalog query.
+
+    Examples:
+        escape_for_query('hello') -> 'hello'
+        escape_for_query('say "hi"') -> 'say \\"hi\\"'
+    """
+    return s.replace('"', '\\"')
+
+
+def build_tag_condition(tag: str) -> str:
+    """
+    Build a Datalog OR condition to match various tag formats.
+
+    Matches: [[tag]], #tag (followed by space/newline), #[[tag]]
+
+    Args:
+        tag: Normalized tag (without #, [[, ]])
+
+    Returns:
+        Datalog condition string
+    """
+    escaped = escape_for_query(tag)
+    return f'''(or (clojure.string/includes? ?s "[[{escaped}]]")
+         (clojure.string/includes? ?s "#{escaped} ")
+         (clojure.string/includes? ?s "#{escaped}\\n")
+         (clojure.string/includes? ?s "#[[{escaped}]]"))'''
+
+
+def build_todo_pattern(status: str) -> str:
+    """
+    Build the Roam TODO/DONE pattern string.
+
+    Args:
+        status: "TODO" or "DONE"
+
+    Returns:
+        Pattern like "{{[[TODO]]}}"
+
+    Raises:
+        ValueError: If status is not TODO or DONE
+    """
+    status = status.upper()
+    if status not in ("TODO", "DONE"):
+        raise ValueError("status must be 'TODO' or 'DONE'")
+    return f"{{{{[[{status}]]}}}}"
+
+
 class Block:
     def __init__(
             self,
@@ -400,18 +465,11 @@ class RoamClient(object):
         Returns:
             List of [block_uid, block_string, page_title] tuples
         """
-        # Normalize tag - remove any existing syntax
-        clean_tag = tag.replace('#', '').replace('[[', '').replace(']]', '').strip()
-        escaped_tag = clean_tag.replace('"', '\\"')
-
-        # Build OR condition for different tag formats
-        tag_condition = f'''(or (clojure.string/includes? ?s "[[{escaped_tag}]]")
-         (clojure.string/includes? ?s "#{escaped_tag} ")
-         (clojure.string/includes? ?s "#{escaped_tag}\\n")
-         (clojure.string/includes? ?s "#[[{escaped_tag}]]"))'''
+        clean_tag = normalize_tag(tag)
+        tag_condition = build_tag_condition(clean_tag)
 
         if page_title:
-            escaped_title = page_title.replace('"', '\\"')
+            escaped_title = escape_for_query(page_title)
             query = f'''
 [:find ?uid ?s
  :where
@@ -530,16 +588,11 @@ class RoamClient(object):
         Returns:
             List of [block_uid, block_string, page_title] tuples
         """
-        status = status.upper()
-        if status not in ("TODO", "DONE"):
-            raise ValueError("status must be 'TODO' or 'DONE'")
-
-        # Roam uses {{[[TODO]]}} and {{[[DONE]]}} format
-        status_pattern = f"{{{{[[{status}]]}}}}"
-        escaped_pattern = status_pattern.replace('"', '\\"')
+        status_pattern = build_todo_pattern(status)
+        escaped_pattern = escape_for_query(status_pattern)
 
         if page_title:
-            escaped_title = page_title.replace('"', '\\"')
+            escaped_title = escape_for_query(page_title)
             query = f'''
 [:find ?uid ?s
  :where
