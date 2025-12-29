@@ -146,6 +146,77 @@ def build_todo_pattern(status: str) -> str:
     return f"{{{{[[{status}]]}}}}"
 
 
+def parse_search_query(query: str) -> dict:
+    """
+    Parse a Google-style search query into structured terms.
+
+    Syntax:
+    - term1 term2: OR logic (match any)
+    - +term or +"phrase": AND logic (must contain)
+    - -term or -"phrase": NOT logic (must exclude)
+    - "phrase with spaces": quoted phrase
+
+    Args:
+        query: Search query string
+
+    Returns:
+        dict with keys:
+        - or_terms: list of terms where any match is sufficient
+        - and_terms: list of terms that must all match
+        - not_terms: list of terms that must not match
+
+    Examples:
+        >>> parse_search_query('python async')
+        {'or_terms': ['python', 'async'], 'and_terms': [], 'not_terms': []}
+
+        >>> parse_search_query('python +async -javascript')
+        {'or_terms': ['python'], 'and_terms': ['async'], 'not_terms': ['javascript']}
+
+        >>> parse_search_query('+"machine learning" -"neural network"')
+        {'or_terms': [], 'and_terms': ['machine learning'], 'not_terms': ['neural network']}
+    """
+    import re
+
+    or_terms = []
+    and_terms = []
+    not_terms = []
+
+    # Pattern to match: +/-"quoted phrase" or +/-word
+    # Groups: (1) prefix (+/-/none), (2) quoted content or (3) unquoted word
+    pattern = r'([+-]?)(?:"([^"]+)"|(\S+))'
+
+    for match in re.finditer(pattern, query):
+        prefix = match.group(1)
+        term = match.group(2) if match.group(2) else match.group(3)
+
+        if not term:
+            continue
+
+        # Handle case where prefix is part of unquoted term (e.g., "+term" captured as term="+term")
+        if not prefix and term.startswith(('+', '-')):
+            prefix = term[0]
+            term = term[1:]
+            # Handle quoted after prefix: +"phrase" -> prefix='+', term='"phrase"'
+            if term.startswith('"') and term.endswith('"'):
+                term = term[1:-1]
+
+        if not term:
+            continue
+
+        if prefix == '+':
+            and_terms.append(term)
+        elif prefix == '-':
+            not_terms.append(term)
+        else:
+            or_terms.append(term)
+
+    return {
+        'or_terms': or_terms,
+        'and_terms': and_terms,
+        'not_terms': not_terms,
+    }
+
+
 class Block:
     def __init__(
             self,
@@ -441,6 +512,134 @@ class RoamClient(object):
 
             # Priority 2: Partial match
             return (2, page)
+
+        results.sort(key=sort_key)
+        return results[:limit]
+
+    async def search_blocks_query(
+        self,
+        query_str: str,
+        limit: int = 20,
+        case_sensitive: bool = True,
+        page_title: str | None = None,
+        tag: str | None = None
+    ):
+        """
+        Search blocks using Google-style query syntax.
+
+        Query syntax:
+        - term1 term2: OR logic (match any)
+        - +term or +"phrase": AND logic (must contain)
+        - -term or -"phrase": NOT logic (must exclude)
+        - "phrase with spaces": quoted phrase
+
+        Args:
+            query_str: Google-style search query
+            limit: Maximum number of results
+            case_sensitive: Whether to match case
+            page_title: Optional page title to scope the search
+            tag: Optional tag to filter results
+
+        Returns:
+            List of [block_uid, block_string, page_title] tuples
+        """
+        parsed = parse_search_query(query_str)
+        or_terms = parsed['or_terms']
+        and_terms = parsed['and_terms']
+        not_terms = parsed['not_terms']
+
+        # Build Datalog conditions
+        conditions = []
+
+        # OR terms: (or [...] [...])
+        if or_terms:
+            or_clauses = []
+            for term in or_terms:
+                escaped = escape_for_query(term)
+                if case_sensitive:
+                    or_clauses.append(f'[(clojure.string/includes? ?s "{escaped}")]')
+                else:
+                    or_clauses.append(f'[(clojure.string/includes? (clojure.string/lower-case ?s) "{escaped.lower()}")]')
+            if len(or_clauses) == 1:
+                conditions.append(or_clauses[0])
+            else:
+                conditions.append(f'(or {" ".join(or_clauses)})')
+
+        # AND terms: each as separate condition
+        for term in and_terms:
+            escaped = escape_for_query(term)
+            if case_sensitive:
+                conditions.append(f'[(clojure.string/includes? ?s "{escaped}")]')
+            else:
+                conditions.append(f'[(clojure.string/includes? (clojure.string/lower-case ?s) "{escaped.lower()}")]')
+
+        # NOT terms: (not [...])
+        for term in not_terms:
+            escaped = escape_for_query(term)
+            if case_sensitive:
+                conditions.append(f'(not [(clojure.string/includes? ?s "{escaped}")])')
+            else:
+                conditions.append(f'(not [(clojure.string/includes? (clojure.string/lower-case ?s) "{escaped.lower()}")])')
+
+        # Add tag condition if specified
+        if tag:
+            clean_tag = normalize_tag(tag)
+            conditions.append(f'[{build_tag_condition(clean_tag)}]')
+
+        # Must have at least one positive condition
+        if not or_terms and not and_terms and not tag:
+            return []
+
+        term_conditions = '\n    '.join(conditions)
+
+        if page_title:
+            escaped_title = escape_for_query(page_title)
+            query = f'''
+[:find ?uid ?s
+ :where
+    [?p :node/title "{escaped_title}"]
+    [?b :block/page ?p]
+    [?b :block/string ?s]
+    [?b :block/uid ?uid]
+    {term_conditions}]
+'''
+            resp = await self.q(query)
+            results = [[uid, s, page_title] for uid, s in resp] if resp else []
+        else:
+            query = f'''
+[:find ?uid ?s ?page-title
+ :where
+    [?b :block/string ?s]
+    [?b :block/uid ?uid]
+    [?b :block/page ?p]
+    [?p :node/title ?page-title]
+    {term_conditions}]
+'''
+            resp = await self.q(query)
+            results = list(resp) if resp else []
+
+        # Sort by relevance (prioritize AND terms, then OR terms)
+        all_positive_terms = and_terms + or_terms
+
+        def sort_key(item):
+            uid, text, page = item[0], item[1], item[2]
+            text_check = text if case_sensitive else text.lower()
+            page_check = page if case_sensitive else page.lower()
+
+            # Count how many terms match
+            match_count = 0
+            for term in all_positive_terms:
+                term_check = term if case_sensitive else term.lower()
+                if term_check in text_check:
+                    match_count += 1
+                # Bonus for page title match
+                if page_check == term_check:
+                    match_count += 2
+                # Bonus for [[term]] or #[[term]]
+                if f'[[{term_check}]]' in text_check:
+                    match_count += 1
+
+            return (-match_count, page)
 
         results.sort(key=sort_key)
         return results[:limit]

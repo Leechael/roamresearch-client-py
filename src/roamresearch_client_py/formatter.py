@@ -52,6 +52,69 @@ def _resolve_refs(text, all_blocks):
     return text
 
 
+def format_ref_block(ref_uid: str, block: dict, depth: int = 0, max_depth: int = 2) -> str:
+    """
+    Format a referenced block with its children as a quoted block.
+
+    Args:
+        ref_uid: The UID of the referenced block
+        block: The block data (with :block/string, :block/children, etc.)
+        depth: Current recursion depth
+        max_depth: Maximum recursion depth for nested refs
+
+    Returns:
+        Formatted string with blockquote format
+    """
+    if not block:
+        return f"> **((_{ref_uid}_))**: _[not found]_"
+
+    text = block.get(':block/string', '')
+    lines = [f"> **((_{ref_uid}_))**: {text}"]
+
+    # Add children as nested items
+    children = _get_sorted_children(block)
+    for child in children:
+        child_text = child.get(':block/string', '')
+        lines.append(f">   - {child_text}")
+
+        # Recursively add grandchildren (up to one level)
+        grandchildren = _get_sorted_children(child)
+        for grandchild in grandchildren:
+            gc_text = grandchild.get(':block/string', '')
+            lines.append(f">     - {gc_text}")
+
+    return '\n'.join(lines)
+
+
+def expand_refs_in_text(text: str, ref_blocks: dict, depth: int = 0, max_depth: int = 2) -> str:
+    """
+    Expand block references in text to show their content.
+
+    Args:
+        text: Text containing ((uid)) references
+        ref_blocks: Dict mapping uid -> block data
+        depth: Current recursion depth
+        max_depth: Maximum recursion depth
+
+    Returns:
+        Text with refs expanded as blockquotes after the line
+    """
+    refs = extract_ref(text)
+    if not refs:
+        return text
+
+    expanded_parts = []
+    for ref_uid in refs:
+        if ref_uid in ref_blocks:
+            block = ref_blocks[ref_uid]
+            expanded = format_ref_block(ref_uid, block, depth, max_depth)
+            expanded_parts.append(expanded)
+
+    if expanded_parts:
+        return text + '\n\n' + '\n\n'.join(expanded_parts)
+    return text
+
+
 def _format_block_text(block, all_blocks):
     """Format a single block's text with heading prefix if applicable."""
     text = block.get(':block/string', '')

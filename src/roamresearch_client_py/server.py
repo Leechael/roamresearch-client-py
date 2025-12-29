@@ -21,7 +21,7 @@ import pendulum
 
 from .client import RoamClient, create_page, create_block
 from .config import get_env_or_config, get_config_dir
-from .formatter import format_block, format_block_as_markdown
+from .formatter import format_block, format_block_as_markdown, extract_ref, expand_refs_in_text
 from .gfm_to_roam import gfm_to_batch_actions, gfm_to_blocks
 from .diff import parse_existing_blocks, diff_block_trees, generate_batch_actions
 
@@ -469,15 +469,14 @@ async def get_or_create_topic_uid(client, topic: str, when: pendulum.DateTime) -
 
 @mcp.tool(
     name="save_markdown",
-    description="""Save a markdown document to Roam Research as a new page, with a link added to today's Daily Notes.
+    description="""Create a new page in Roam Research.
 
-Parameters:
-- title: Page title (plain text, no markdown)
-- markdown: Document content in GitHub Flavored Markdown (GFM). Do not include title as H1.
+Use when: saving notes, creating pages, storing content to the graph.
 
-Returns: Task ID and page link. Content blocks are processed in background.
+- title: Page title (plain text)
+- markdown: Content in GFM. Omit title as H1.
 
-Example: save_markdown(title="Meeting Notes", markdown="## Attendees\\n- Alice\\n- Bob")
+Returns task ID and page link. Auto-links to today's Daily Notes.
 """
 )
 async def save_markdown(title: str, markdown: str) -> str:
@@ -552,14 +551,13 @@ async def save_markdown(title: str, markdown: str) -> str:
 
 @mcp.tool(
     name="query",
-    description="""Execute a Datalog query against your Roam Research graph.
+    description="""Run raw Datalog query on the Roam graph.
 
-Parameters:
-- q: Valid Datalog query string
+Use when: advanced queries, custom filters, specific attributes. Prefer search/get for common cases.
 
-Returns: Query results as JSON.
+- q: Datalog query string
 
-Example: query(q="[:find ?title :where [?e :node/title ?title]]")
+Returns JSON.
 """
 )
 async def handle_query_roam(q: str) -> str:
@@ -578,47 +576,113 @@ async def handle_query_roam(q: str) -> str:
 
 @mcp.tool(
     name="get",
-    description="""Read a page or block from Roam Research and return its content as markdown.
+    description="""Read a page or block from Roam, including all children.
 
-Parameters:
-- identifier: Page title or block UID. Accepts "((uid))" format for block references.
-- raw: If true, return raw JSON instead of markdown. Default: false.
+Use when: reading notes, viewing page content, retrieving specific blocks.
 
-Returns: Page/block content as GFM markdown, or JSON if raw=true.
+- identifier: Page title or block UID. Accepts list for batch retrieval.
+- raw: Return JSON instead of markdown. Default: false.
+- expand_refs: Expand ((uid)) references inline. Default: true.
 
-Example: get(identifier="Project Notes") or get(identifier="abc123xyz")
+Returns markdown with children. Block refs shown as quoted blocks.
 """
 )
-async def handle_get(identifier: str, raw: bool = False) -> str:
-    uid = parse_uid(identifier)
+async def handle_get(identifier: str | List[str], raw: bool = False, expand_refs: bool = True) -> str:
+    # Normalize to list for batch processing
+    identifiers = [identifier] if isinstance(identifier, str) else identifier
 
-    try:
-        async with RoamClient() as client:
-            result = None
-            is_page = False
+    def collect_all_refs(block: dict, collected: set) -> set:
+        """Recursively collect all ((uid)) refs from a block and its children."""
+        text = block.get(':block/string', '')
+        refs = extract_ref(text)
+        collected.update(refs)
+        for child in block.get(':block/children', []):
+            collect_all_refs(child, collected)
+        return collected
 
-            if uid:
-                result = await client.get_block_by_uid(uid)
+    def collect_existing_uids(block: dict, uids: set) -> set:
+        """Collect all UIDs already present in the result."""
+        uid = block.get(':block/uid')
+        if uid:
+            uids.add(uid)
+        for child in block.get(':block/children', []):
+            collect_existing_uids(child, uids)
+        return uids
 
-            if not result:
-                result = await client.get_page_by_title(identifier)
-                is_page = True
+    async def get_single(ident: str, client) -> tuple[str, str | None, bool]:
+        """Get a single identifier, returns (identifier, result_text, is_error)"""
+        uid = parse_uid(ident)
+        result = None
+        is_page = False
+
+        if uid:
+            result = await client.get_block_by_uid(uid)
 
         if not result:
-            return f"Error: '{identifier}' not found."
+            result = await client.get_page_by_title(ident)
+            is_page = True
+
+        if not result:
+            return (ident, f"Error: '{ident}' not found.", True)
 
         if raw:
-            import json
-            return json.dumps(result, indent=2, ensure_ascii=False)
+            return (ident, json.dumps(result, indent=2, ensure_ascii=False), False)
 
         children = result.get(':block/children', [])
         if children:
             children = sorted(children, key=lambda x: x.get(':block/order', 0))
 
+        # Format content
         if is_page:
-            return format_block_as_markdown(children)
+            content = format_block_as_markdown(children)
         else:
-            return format_block_as_markdown([result])
+            content = format_block_as_markdown([result])
+
+        # Expand refs if enabled
+        if expand_refs:
+            # Collect all refs in the content
+            all_refs = set()
+            if is_page:
+                for child in children:
+                    collect_all_refs(child, all_refs)
+            else:
+                collect_all_refs(result, all_refs)
+
+            # Get existing UIDs to avoid re-fetching
+            existing_uids = set()
+            if is_page:
+                for child in children:
+                    collect_existing_uids(child, existing_uids)
+            else:
+                collect_existing_uids(result, existing_uids)
+
+            # Fetch external refs (not in current result)
+            external_refs = all_refs - existing_uids
+            ref_blocks = {}
+            for ref_uid in external_refs:
+                ref_block = await client.get_block_by_uid(ref_uid)
+                if ref_block:
+                    ref_blocks[ref_uid] = ref_block
+
+            # Expand refs in the content
+            if ref_blocks:
+                content = expand_refs_in_text(content, ref_blocks)
+
+        return (ident, content, False)
+
+    try:
+        async with RoamClient() as client:
+            results = []
+            for ident in identifiers:
+                ident_name, content, is_error = await get_single(ident, client)
+                if len(identifiers) > 1:
+                    # Add header for batch results
+                    header = f"## {ident_name}\n\n" if not is_error else ""
+                    results.append(f"{header}{content}")
+                else:
+                    results.append(content)
+
+        return "\n\n---\n\n".join(results) if len(results) > 1 else results[0]
 
     except Exception as e:
         return f"Error: {e}"
@@ -626,25 +690,26 @@ async def handle_get(identifier: str, raw: bool = False) -> str:
 
 @mcp.tool(
     name="search",
-    description="""Search for blocks containing specified terms in Roam Research.
+    description="""Search blocks in Roam.
 
-Parameters:
-- terms: List of search terms. All terms must match (AND logic). Can be empty if tag is specified.
-- tag: Filter results by tag (searches [[tag]], #tag, #[[tag]]). Optional.
-- page: Limit search to a specific page title. Optional.
-- case_sensitive: Case-sensitive matching. Default: true.
-- limit: Maximum results to return. Default: 20.
+Use when: finding content, locating keywords, searching by tag.
 
-Returns: Matching blocks grouped by page, showing UID and text preview.
+Syntax (Google-style):
+  python async        → OR (either term)
+  +python +async      → AND (both required)
+  -javascript         → exclude term
+  "exact phrase"      → phrase match
 
-Examples:
-- search(terms=["python", "async"]) - find blocks containing both terms
-- search(terms=[], tag="TODO") - find all blocks with #TODO tag
-- search(terms=["meeting"], tag="project") - find "meeting" in blocks tagged #project
+- query: Search string with +/- operators
+- tag: Filter by tag. Optional.
+- page: Limit to page. Optional.
+- limit: Max results. Default: 20.
+
+Returns blocks grouped by page with UID.
 """
 )
 async def handle_search(
-    terms: List[str],
+    query: str = "",
     tag: str | None = None,
     page: str | None = None,
     case_sensitive: bool = True,
@@ -652,16 +717,16 @@ async def handle_search(
 ) -> str:
     try:
         async with RoamClient() as client:
-            # If only tag is specified (no terms), use search_by_tag
-            if not terms and tag:
+            # If only tag is specified (no query), use search_by_tag
+            if not query and tag:
                 results = await client.search_by_tag(
                     tag,
                     limit,
                     page_title=page
                 )
             else:
-                results = await client.search_blocks(
-                    terms,
+                results = await client.search_blocks_query(
+                    query,
                     limit,
                     case_sensitive=case_sensitive,
                     page_title=page,
@@ -701,18 +766,15 @@ async def handle_search(
 
 @mcp.tool(
     name="find_references",
-    description="""Find all blocks that reference a given page or block in Roam Research.
+    description="""Find backlinks to a page or block.
 
-Parameters:
-- identifier: Page title or block UID to find references to.
-  - For pages: finds all [[page]] and #page references
-  - For blocks: finds all ((uid)) block references
+Use when: finding what links to a page, discovering connections, tracing references.
 
-Returns: List of referencing blocks grouped by page.
+- identifier: Page title or block UID
+  - Page: finds [[page]] and #page refs
+  - Block: finds ((uid)) refs
 
-Examples:
-- find_references(identifier="Project Notes") - find all links to [[Project Notes]]
-- find_references(identifier="abc123xyz") - find all ((abc123xyz)) block refs
+Returns referencing blocks grouped by page.
 """
 )
 async def handle_find_references(identifier: str, limit: int = 50) -> str:
@@ -762,19 +824,15 @@ async def handle_find_references(identifier: str, limit: int = 50) -> str:
 
 @mcp.tool(
     name="search_todos",
-    description="""Search for TODO or DONE items in Roam Research.
+    description="""Find TODO or DONE items in Roam.
 
-Parameters:
+Use when: listing tasks, checking pending/completed items.
+
 - status: "TODO" or "DONE". Default: "TODO".
-- page: Limit search to a specific page title. Optional.
-- limit: Maximum results to return. Default: 50.
+- page: Limit to page. Optional.
+- limit: Max results. Default: 50.
 
-Returns: List of TODO/DONE items grouped by page.
-
-Examples:
-- search_todos() - find all TODO items
-- search_todos(status="DONE") - find all completed items
-- search_todos(status="TODO", page="Project Notes") - find TODOs in specific page
+Returns items grouped by page.
 """
 )
 async def handle_search_todos(
@@ -825,20 +883,15 @@ async def handle_search_todos(
 
 @mcp.tool(
     name="update_markdown",
-    description="""Update an existing Roam Research page or block with new markdown content.
+    description="""Update an existing page or block in Roam.
 
-Parameters:
-- identifier: Page title or block UID to update
-- markdown: New content in GitHub Flavored Markdown (GFM)
-- dry_run: If true, return preview without making changes. Default: false.
+Use when: editing pages, modifying content, revising notes.
 
-Returns: Summary of changes made (creates, updates, moves, deletes) and preserved UIDs.
+- identifier: Page title or block UID
+- markdown: New content in GFM
+- dry_run: Preview changes only. Default: false.
 
-IMPORTANT: This preserves existing block UIDs where possible to maintain references.
-Blocks with identical text are matched and reused. Order/parent changes use move-block
-to preserve UIDs. Only truly new/deleted content uses create/delete actions.
-
-Example: update_markdown(identifier="Meeting Notes", markdown="## Updated content")
+Returns change summary. Preserves block UIDs where possible.
 """
 )
 async def update_markdown(identifier: str, markdown: str, dry_run: bool = False) -> str:
@@ -898,14 +951,13 @@ async def update_markdown(identifier: str, markdown: str, dry_run: bool = False)
 
 @mcp.tool(
     name="get_journaling_by_date",
-    description="""Get journal entries from Daily Notes for a specific date.
+    description="""Get Daily Notes journal for a date.
 
-Parameters:
-- when: Date string in ISO8601/RFC2822/RFC3339 format. Optional, defaults to today.
+Use when: reading daily notes, checking journal entries.
 
-Returns: Journal content as formatted text.
+- when: Date string (ISO8601). Default: today.
 
-Example: get_journaling_by_date(when="2024-01-15") or get_journaling_by_date()
+Returns journal content as text.
 """
 )
 async def get_journaling_by_date(when=None):
