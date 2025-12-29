@@ -9,6 +9,7 @@ from roamresearch_client_py.client import (
     escape_for_query,
     build_tag_condition,
     build_todo_pattern,
+    parse_search_query,
     RoamClient,
 )
 
@@ -82,6 +83,68 @@ class TestBuildTagCondition:
     def test_condition_is_or_clause(self):
         condition = build_tag_condition("test")
         assert condition.startswith("(or ")
+
+
+class TestParseSearchQuery:
+    """Tests for parse_search_query() function."""
+
+    def test_simple_or_terms(self):
+        """Plain terms should be parsed as OR terms."""
+        result = parse_search_query("python async")
+        assert result['or_terms'] == ['python', 'async']
+        assert result['and_terms'] == []
+        assert result['not_terms'] == []
+
+    def test_and_terms_with_plus(self):
+        """+term should be parsed as AND term."""
+        result = parse_search_query("+python +async")
+        assert result['or_terms'] == []
+        assert result['and_terms'] == ['python', 'async']
+        assert result['not_terms'] == []
+
+    def test_not_terms_with_minus(self):
+        """-term should be parsed as NOT term."""
+        result = parse_search_query("-javascript -typescript")
+        assert result['or_terms'] == []
+        assert result['and_terms'] == []
+        assert result['not_terms'] == ['javascript', 'typescript']
+
+    def test_mixed_terms(self):
+        """Mixed query with OR, AND, and NOT terms."""
+        result = parse_search_query("python +async -javascript")
+        assert result['or_terms'] == ['python']
+        assert result['and_terms'] == ['async']
+        assert result['not_terms'] == ['javascript']
+
+    def test_quoted_phrase(self):
+        """Quoted phrases should be parsed as single terms."""
+        result = parse_search_query('"machine learning"')
+        assert result['or_terms'] == ['machine learning']
+
+    def test_quoted_and_term(self):
+        """+"phrase" should be AND term."""
+        result = parse_search_query('+"machine learning"')
+        assert result['and_terms'] == ['machine learning']
+
+    def test_quoted_not_term(self):
+        """-"phrase" should be NOT term."""
+        result = parse_search_query('-"neural network"')
+        assert result['not_terms'] == ['neural network']
+
+    def test_complex_query(self):
+        """Complex query with multiple types of terms."""
+        result = parse_search_query('python tensorflow +"deep learning" -"neural network"')
+        assert 'python' in result['or_terms']
+        assert 'tensorflow' in result['or_terms']
+        assert 'deep learning' in result['and_terms']
+        assert 'neural network' in result['not_terms']
+
+    def test_empty_query(self):
+        """Empty query should return empty lists."""
+        result = parse_search_query("")
+        assert result['or_terms'] == []
+        assert result['and_terms'] == []
+        assert result['not_terms'] == []
 
 
 class TestBuildTodoPattern:
