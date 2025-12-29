@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4 - 2025-12-29
+
+- fix(mcp): handle empty identifier list in handle_get
+- feat(mcp): enhance search syntax and batch operations
+
 ## 0.3.3 - 2025-12-29
 
 - fix(cli): exit code and refs lookup improvements
