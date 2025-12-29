@@ -292,16 +292,18 @@ class RoamClient(object):
         terms: list[str],
         limit: int = 20,
         case_sensitive: bool = True,
-        page_title: str | None = None
+        page_title: str | None = None,
+        tag: str | None = None
     ):
         """
-        Search blocks containing all given terms.
+        Search blocks containing all given terms, optionally filtered by tag.
 
         Args:
             terms: List of search terms (all must match)
             limit: Maximum number of results
             case_sensitive: Whether to match case
             page_title: Optional page title to scope the search
+            tag: Optional tag to filter results (searches for [[tag]], #tag, #[[tag]])
 
         Returns:
             List of [block_uid, block_string, page_title] tuples, sorted by relevance:
@@ -317,6 +319,16 @@ class RoamClient(object):
                 conditions.append(f'[(clojure.string/includes? ?s "{escaped}")]')
             else:
                 conditions.append(f'[(clojure.string/includes? (clojure.string/lower-case ?s) "{escaped.lower()}")]')
+
+        # Add tag condition if specified
+        if tag:
+            clean_tag = tag.replace('#', '').replace('[[', '').replace(']]', '').strip()
+            escaped_tag = clean_tag.replace('"', '\\"')
+            # Match [[tag]], #tag, or #[[tag]]
+            tag_condition = f'''[(or (clojure.string/includes? ?s "[[{escaped_tag}]]")
+         (clojure.string/includes? ?s "#{escaped_tag}")
+         (clojure.string/includes? ?s "#[[{escaped_tag}]]"))]'''
+            conditions.append(tag_condition)
 
         term_conditions = '\n    '.join(conditions)
 
@@ -369,6 +381,191 @@ class RoamClient(object):
             return (2, page)
 
         results.sort(key=sort_key)
+        return results[:limit]
+
+    async def search_by_tag(
+        self,
+        tag: str,
+        limit: int = 50,
+        page_title: str | None = None
+    ):
+        """
+        Search for blocks containing a specific tag.
+
+        Args:
+            tag: Tag to search for (with or without # or [[]])
+            limit: Maximum number of results
+            page_title: Optional page title to scope the search
+
+        Returns:
+            List of [block_uid, block_string, page_title] tuples
+        """
+        # Normalize tag - remove any existing syntax
+        clean_tag = tag.replace('#', '').replace('[[', '').replace(']]', '').strip()
+        escaped_tag = clean_tag.replace('"', '\\"')
+
+        # Build OR condition for different tag formats
+        tag_condition = f'''(or (clojure.string/includes? ?s "[[{escaped_tag}]]")
+         (clojure.string/includes? ?s "#{escaped_tag} ")
+         (clojure.string/includes? ?s "#{escaped_tag}\\n")
+         (clojure.string/includes? ?s "#[[{escaped_tag}]]"))'''
+
+        if page_title:
+            escaped_title = page_title.replace('"', '\\"')
+            query = f'''
+[:find ?uid ?s
+ :where
+    [?p :node/title "{escaped_title}"]
+    [?b :block/page ?p]
+    [?b :block/string ?s]
+    [?b :block/uid ?uid]
+    [{tag_condition}]]
+'''
+            resp = await self.q(query)
+            results = [[uid, s, page_title] for uid, s in resp] if resp else []
+        else:
+            query = f'''
+[:find ?uid ?s ?page-title
+ :where
+    [?b :block/string ?s]
+    [?b :block/uid ?uid]
+    [?b :block/page ?p]
+    [?p :node/title ?page-title]
+    [{tag_condition}]]
+'''
+            resp = await self.q(query)
+            results = list(resp) if resp else []
+
+        return results[:limit]
+
+    async def find_references(
+        self,
+        uid: str,
+        limit: int = 50
+    ):
+        """
+        Find all blocks that reference a given block or page.
+
+        This searches for:
+        - Block references: ((uid))
+        - Block embeds: {{[[embed]]: ((uid))}}
+
+        Args:
+            uid: The UID of the block or page to find references to
+            limit: Maximum number of results
+
+        Returns:
+            List of [block_uid, block_string, page_title] tuples
+        """
+        escaped_uid = uid.replace('"', '\\"')
+
+        # Search for blocks containing ((uid)) reference
+        query = f'''
+[:find ?ref-uid ?s ?page-title
+ :where
+    [?b :block/string ?s]
+    [?b :block/uid ?ref-uid]
+    [?b :block/page ?p]
+    [?p :node/title ?page-title]
+    [(clojure.string/includes? ?s "(({escaped_uid}))")]
+]
+'''
+        resp = await self.q(query)
+        results = list(resp) if resp else []
+        return results[:limit]
+
+    async def find_page_references(
+        self,
+        title: str,
+        limit: int = 50
+    ):
+        """
+        Find all blocks that reference a given page by title.
+
+        This searches for:
+        - Page links: [[title]]
+        - Tags: #title or #[[title]]
+
+        Args:
+            title: The title of the page to find references to
+            limit: Maximum number of results
+
+        Returns:
+            List of [block_uid, block_string, page_title] tuples
+        """
+        escaped_title = title.replace('"', '\\"')
+
+        # Search using :block/refs which tracks all references
+        query = f'''
+[:find ?ref-uid ?s ?ref-page-title
+ :where
+    [?target :node/title "{escaped_title}"]
+    [?b :block/refs ?target]
+    [?b :block/string ?s]
+    [?b :block/uid ?ref-uid]
+    [?b :block/page ?p]
+    [?p :node/title ?ref-page-title]
+]
+'''
+        resp = await self.q(query)
+        results = list(resp) if resp else []
+        return results[:limit]
+
+    async def search_todos(
+        self,
+        status: str = "TODO",
+        limit: int = 50,
+        page_title: str | None = None
+    ):
+        """
+        Search for TODO or DONE items in Roam.
+
+        Roam stores todos as {{[[TODO]]}} and {{[[DONE]]}}.
+
+        Args:
+            status: "TODO" or "DONE"
+            limit: Maximum number of results
+            page_title: Optional page title to scope the search
+
+        Returns:
+            List of [block_uid, block_string, page_title] tuples
+        """
+        status = status.upper()
+        if status not in ("TODO", "DONE"):
+            raise ValueError("status must be 'TODO' or 'DONE'")
+
+        # Roam uses {{[[TODO]]}} and {{[[DONE]]}} format
+        status_pattern = f"{{{{[[{status}]]}}}}"
+        escaped_pattern = status_pattern.replace('"', '\\"')
+
+        if page_title:
+            escaped_title = page_title.replace('"', '\\"')
+            query = f'''
+[:find ?uid ?s
+ :where
+    [?p :node/title "{escaped_title}"]
+    [?b :block/page ?p]
+    [?b :block/string ?s]
+    [?b :block/uid ?uid]
+    [(clojure.string/includes? ?s "{escaped_pattern}")]
+]
+'''
+            resp = await self.q(query)
+            results = [[uid, s, page_title] for uid, s in resp] if resp else []
+        else:
+            query = f'''
+[:find ?uid ?s ?page-title
+ :where
+    [?b :block/string ?s]
+    [?b :block/uid ?uid]
+    [?b :block/page ?p]
+    [?p :node/title ?page-title]
+    [(clojure.string/includes? ?s "{escaped_pattern}")]
+]
+'''
+            resp = await self.q(query)
+            results = list(resp) if resp else []
+
         return results[:limit]
 
     async def get_block_by_uid(self, uid: str):
