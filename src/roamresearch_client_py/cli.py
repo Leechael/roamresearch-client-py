@@ -238,8 +238,7 @@ def main(argv: Sequence[str] | None = None):
 
     if args.command == "search":
         if not args.terms and not args.tag:
-            print("Error: Provide search terms or --tag.", file=sys.stderr)
-            return
+            parser.error("search requires terms or --tag")
         _run_async(_search_blocks(
             args.terms or [],
             args.limit,
@@ -434,15 +433,27 @@ async def _query(query: str | None, args: list[str] | None):
 
 async def _refs(identifier: str, limit: int):
     """Find blocks referencing a page or block."""
-    uid = _parse_uid(identifier)
+    identifier = identifier.strip()
 
-    async with RoamClient() as client:
-        if uid:
-            # Block reference search
+    # Explicit ((uid)) format - definitely block reference
+    if identifier.startswith('((') and identifier.endswith('))'):
+        uid = identifier[2:-2]
+        async with RoamClient() as client:
             results = await client.find_references(uid, limit=limit)
-        else:
-            # Page reference search
-            results = await client.find_page_references(identifier, limit=limit)
+        if not results:
+            print("No references found.")
+            return
+        _print_results_grouped(results)
+        return
+
+    # Otherwise: try page refs first, fallback to block refs
+    async with RoamClient() as client:
+        results = await client.find_page_references(identifier, limit=limit)
+        if not results:
+            # Fallback: maybe it's a block UID
+            uid = _parse_uid(identifier)
+            if uid:
+                results = await client.find_references(uid, limit=limit)
 
     if not results:
         print("No references found.")
