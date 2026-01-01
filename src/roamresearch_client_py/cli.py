@@ -6,7 +6,7 @@ import sys
 from typing import Sequence
 
 from . import __version__
-from .config import init_config_file, CONFIG_FILE, configure_logging
+from .config import init_config_file, get_config_file, configure_logging
 from .server import serve
 from .client import RoamClient, create_page
 from .gfm_to_roam import gfm_to_batch_actions
@@ -208,12 +208,13 @@ def main(argv: Sequence[str] | None = None):
     args = parser.parse_args(argv)
 
     if args.command == "init":
-        if CONFIG_FILE.exists() and not args.force:
-            print(f"Configuration file already exists: {CONFIG_FILE}")
+        config_file = get_config_file()
+        if config_file.exists() and not args.force:
+            print(f"Configuration file already exists: {config_file}")
             print("Use --force to overwrite.")
             return
-        if args.force and CONFIG_FILE.exists():
-            CONFIG_FILE.unlink()
+        if args.force and config_file.exists():
+            config_file.unlink()
         config_path = init_config_file()
         print(f"Configuration file created: {config_path}")
         return

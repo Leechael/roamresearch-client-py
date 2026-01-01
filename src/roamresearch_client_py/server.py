@@ -1,5 +1,6 @@
 from typing import List, cast
 from dataclasses import dataclass
+import argparse
 import pprint
 from itertools import chain
 import logging
@@ -1551,4 +1552,16 @@ async def serve(host: str | None = None, port: int | None = None):
 
 
 if __name__ == "__main__":
-    asyncio.run(serve())
+    parser = argparse.ArgumentParser(prog="python -m roamresearch_client_py.server")
+    parser.add_argument("--host", help="Host to bind (overrides config/env)")
+    parser.add_argument("--port", type=int, help="Port to bind (overrides config/env)")
+    parser.add_argument(
+        "--config",
+        help="Path to config.toml (sets ROAM_CONFIG_FILE)",
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        os.environ["ROAM_CONFIG_FILE"] = args.config
+
+    asyncio.run(serve(host=args.host, port=args.port))
