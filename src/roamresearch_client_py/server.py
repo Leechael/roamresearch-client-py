@@ -11,6 +11,7 @@ import traceback
 import sqlite3
 from datetime import datetime
 import json
+import re
 
 from dotenv import load_dotenv
 import mcp.types as types
@@ -55,6 +56,10 @@ def _get_transport_security() -> TransportSecuritySettings | None:
 
 mcp = FastMCP(name="RoamResearch", stateless_http=True, transport_security=_get_transport_security())
 logger = logging.getLogger(__name__)
+
+# Heuristic: when updating a single block, treat large/multiline content as
+# markdown that should be expanded into children blocks.
+BLOCK_UPDATE_MARKDOWN_NEWLINE_THRESHOLD = 5
 
 # Background task management
 background_tasks: set[asyncio.Task] = set()
@@ -231,6 +236,59 @@ def parse_uid(s: str) -> str | None:
     if len(s) <= 40 and all(c.isalnum() or c in '-_' for c in s):
         return s
     return None
+
+
+_MD_HEADING_RE = re.compile(r"^(#{1,6})(?:\s+(.*))?\s*$")
+
+
+def _should_parse_block_update_as_markdown(text: str) -> bool:
+    """
+    Heuristic: treat block updates as structured markdown when the payload is
+    clearly multi-line content or starts with a markdown heading.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.count("\n") > BLOCK_UPDATE_MARKDOWN_NEWLINE_THRESHOLD:
+        return True
+    return re.match(r"^#{1,6}\s", stripped) is not None
+
+
+def _split_root_and_children_markdown(markdown: str) -> tuple[str, int | None, str]:
+    """
+    Split markdown intended to update a single block into:
+      - root block text (string)
+      - root block heading (1..3) or None
+      - children markdown (remaining content)
+
+    Rule:
+      - If the first non-empty line is a markdown heading, use it for root text/heading.
+      - Otherwise, use that line as root text (no heading).
+      - The remaining lines (if any) are treated as markdown for children.
+    """
+    stripped = markdown.strip()
+    if not stripped:
+        return ("", None, "")
+
+    lines = stripped.splitlines()
+    first_idx = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first_idx is None:
+        return ("", None, "")
+
+    first_line = lines[first_idx].rstrip()
+    rest_lines = lines[first_idx + 1 :]
+
+    heading_match = _MD_HEADING_RE.match(first_line.strip())
+    if heading_match:
+        level = len(heading_match.group(1))
+        root_heading = min(level, 3)
+        root_text = (heading_match.group(2) or "").strip()
+    else:
+        root_heading = None
+        root_text = first_line.strip()
+
+    children_markdown = "\n".join(rest_lines).strip("\n")
+    return (root_text, root_heading, children_markdown)
 
 
 async def _process_content_blocks_background(task_id: str, page_uid: str, actions: list):
@@ -895,6 +953,11 @@ Use when: editing pages, modifying content, revising notes.
 - dry_run: Preview changes only. Default: false.
 
 Returns change summary. Preserves block UIDs where possible.
+
+Note: when identifier is a block UID, multi-line markdown (or content starting
+with a markdown heading) is treated as structured content: the first line/heading
+updates the target block itself, and the remaining markdown is converted into
+children blocks.
 """
 )
 async def update_markdown(identifier: str, markdown: str, dry_run: bool = False) -> str:
@@ -902,11 +965,73 @@ async def update_markdown(identifier: str, markdown: str, dry_run: bool = False)
 
     async with RoamClient() as client:
         if uid:
-            # Single block update - synchronous
-            result = await client.update_block_text(uid, markdown.strip(), dry_run=dry_run)
-            stats = result['stats']
+            text = markdown.strip()
+
+            if not _should_parse_block_update_as_markdown(text):
+                # Single block update (plain text)
+                result = await client.update_block_text(uid, text, dry_run=dry_run)
+                stats = result["stats"]
+                prefix = "Dry run - would make" if dry_run else "Updated"
+                return f"{prefix}: {stats['updates']} updates"
+
+            # Structured update: first line/heading updates the block itself,
+            # remaining markdown becomes children.
+            existing_block = await client.get_block_by_uid(uid)
+            if not existing_block:
+                return f"Error: Block not found: {uid}"
+
+            root_text, root_heading, children_markdown = _split_root_and_children_markdown(text)
+
+            existing_text = existing_block.get(":block/string", "")
+            existing_heading = existing_block.get(":block/heading")
+
+            root_update_action: dict = {"action": "update-block", "block": {"uid": uid}}
+            needs_root_update = False
+
+            if root_text != existing_text:
+                root_update_action["block"]["string"] = root_text
+                needs_root_update = True
+
+            if root_heading is not None:
+                if root_heading != existing_heading:
+                    root_update_action["block"]["heading"] = root_heading
+                    needs_root_update = True
+            elif existing_heading is not None:
+                # Clear heading if the new root is not a heading.
+                root_update_action["block"]["heading"] = 0
+                needs_root_update = True
+
+            actions: list[dict] = []
+            updates_root = 0
+            if needs_root_update:
+                actions.append(root_update_action)
+                updates_root = 1
+
+            creates = moves = deletes = 0
+            updates_children = 0
+
+            if children_markdown.strip():
+                existing_children = parse_existing_blocks(existing_block)
+                new_children = gfm_to_blocks(children_markdown, uid, skip_h1=False)
+                diff = diff_block_trees(existing_children, new_children, uid)
+                actions.extend(generate_batch_actions(diff))
+                stats = diff.stats()
+                creates = stats["creates"]
+                updates_children = stats["updates"]
+                moves = stats["moves"]
+                deletes = stats["deletes"]
+
+            updates = updates_root + updates_children
             prefix = "Dry run - would make" if dry_run else "Updated"
-            return f"{prefix}: {stats['updates']} updates"
+
+            if dry_run:
+                return f"{prefix}: {creates} creates, {updates} updates, {moves} moves, {deletes} deletes"
+
+            if not actions:
+                return "No changes needed"
+
+            await client.batch_actions(actions)
+            return f"{prefix}: {creates} creates, {updates} updates, {moves} moves, {deletes} deletes"
 
         # Page update - compute diff first
         page = await client.get_page_by_title(identifier)

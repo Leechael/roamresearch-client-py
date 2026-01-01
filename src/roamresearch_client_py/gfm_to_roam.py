@@ -162,7 +162,7 @@ def ast_to_block(
     return []
 
 
-def gfm_to_blocks(raw: str, pid: str):
+def gfm_to_blocks(raw: str, pid: str, *, skip_h1: bool = True):
     blocks = []
     ref = BlockRef(block_uid=pid)
 
@@ -173,7 +173,7 @@ def gfm_to_blocks(raw: str, pid: str):
         blk = cast(dict, blk)
         if (blk['type']) == 'heading':
             level = blk['attrs']['level']
-            if level == 1:
+            if skip_h1 and level == 1:
                 continue
             while pid_stack[-1]['level'] >= level:
                 pid_stack.pop()
