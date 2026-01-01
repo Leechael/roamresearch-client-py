@@ -81,6 +81,14 @@ def init_config_file() -> Path:
 # port = 9000
 # topic_node = ""
 # allowed_hosts = ""  # Comma-separated list of allowed hosts for remote MCP
+# cors_allow_origins = ""  # Comma-separated list; use "*" to allow any origin
+# cors_allow_origin_regex = ""  # Regex for allowed Origin
+# cors_auto_allow_origin_from_host = true  # Default true; allow Origin matching "{proto}://{Host}" (nginx-friendly)
+# cors_allow_headers = "authorization,content-type"
+# cors_allow_methods = "GET,POST,OPTIONS"
+# cors_allow_credentials = false
+# cors_max_age = 600
+# cors_allow_private_network = false
 
 [storage]
 # dir = ""  # Directory for debug files

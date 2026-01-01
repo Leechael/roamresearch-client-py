@@ -138,6 +138,12 @@ Notes:
 - `oauth.clients` is a static allowlist of OAuth2 `client_id`/`client_secret` pairs that can call `/oauth/token`.
 - Multiple clients are supported by adding multiple `[[oauth.clients]]` sections.
 
+Browser CORS / preflight:
+
+- Some browser MCP clients will send `OPTIONS /sse` preflight requests. Configure allowed origins via:
+  - `mcp.cors_allow_origins` (comma-separated) or `mcp.cors_allow_origin_regex`
+  - `mcp.cors_auto_allow_origin_from_host = true` (default) allows same-origin requests based on the request `Host` (recommended when behind nginx that sets `Host`/`X-Forwarded-Proto`).
+
 ## SDK
 
 ### Connect

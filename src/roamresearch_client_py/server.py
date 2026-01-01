@@ -468,6 +468,10 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
         if not self.settings.enabled or not self.settings.require_auth:
             return await call_next(request)
 
+        # Always allow CORS preflight (handled elsewhere); browsers can't attach Authorization reliably.
+        if request.method.upper() == "OPTIONS":
+            return await call_next(request)
+
         path = request.url.path
         # Always allow oauth discovery + token endpoint without auth.
         if path.startswith("/.well-known/oauth-authorization-server"):
@@ -508,6 +512,160 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
             return _unauthorized("insufficient_scope")
 
         return await call_next(request)
+
+
+class McpCorsMiddleware(BaseHTTPMiddleware):
+    """
+    Minimal CORS support for browser-based MCP clients.
+
+    We handle OPTIONS preflight explicitly for /mcp and the SSE transport endpoints
+    (/sse, /messages) because the underlying MCP routes may not register OPTIONS.
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.cors = _load_mcp_cors_settings()
+
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin")
+        is_options = request.method.upper() == "OPTIONS"
+
+        # Only treat as CORS preflight if browser sets these headers.
+        is_preflight = is_options and bool(request.headers.get("access-control-request-method"))
+
+        path = request.url.path
+        is_mcp_transport = path == "/mcp" or path == "/sse" or path == "/messages"
+
+        if is_preflight and is_mcp_transport:
+            headers = _cors_headers_for_request(request, cors=self.cors)
+            return Response(status_code=204, headers=headers)
+
+        response = await call_next(request)
+
+        # Add CORS headers to actual responses when Origin is present and allowed.
+        if origin:
+            headers = _cors_headers_for_request(request, cors=self.cors)
+            allow_origin = headers.get("Access-Control-Allow-Origin")
+            if allow_origin:
+                response.headers["Access-Control-Allow-Origin"] = allow_origin
+            if "Access-Control-Allow-Credentials" in headers:
+                response.headers["Access-Control-Allow-Credentials"] = headers["Access-Control-Allow-Credentials"]
+            if "Vary" in headers:
+                response.headers["Vary"] = headers["Vary"]
+
+        return response
+
+
+def _load_mcp_cors_settings() -> dict:
+    cfg = load_config()
+    mcp_cfg = cfg.get("mcp", {}) if isinstance(cfg, dict) else {}
+
+    allow_origins_raw = get_env_or_config("MCP_CORS_ALLOW_ORIGINS", "mcp.cors_allow_origins", "")
+    allow_origin_regex = get_env_or_config("MCP_CORS_ALLOW_ORIGIN_REGEX", "mcp.cors_allow_origin_regex", "")
+    allow_headers_raw = get_env_or_config(
+        "MCP_CORS_ALLOW_HEADERS",
+        "mcp.cors_allow_headers",
+        "authorization,content-type",
+    )
+    allow_methods_raw = get_env_or_config(
+        "MCP_CORS_ALLOW_METHODS",
+        "mcp.cors_allow_methods",
+        "GET,POST,OPTIONS",
+    )
+    allow_credentials = _parse_bool(get_env_or_config(
+        "MCP_CORS_ALLOW_CREDENTIALS",
+        "mcp.cors_allow_credentials",
+        False,
+    ), False)
+    auto_allow_origin_from_host = _parse_bool(get_env_or_config(
+        "MCP_CORS_AUTO_ALLOW_ORIGIN_FROM_HOST",
+        "mcp.cors_auto_allow_origin_from_host",
+        True,
+    ), False)
+    max_age = int(get_env_or_config("MCP_CORS_MAX_AGE", "mcp.cors_max_age", 600))
+    allow_private_network = _parse_bool(get_env_or_config(
+        "MCP_CORS_ALLOW_PRIVATE_NETWORK",
+        "mcp.cors_allow_private_network",
+        False,
+    ), False)
+
+    allow_origins: list[str] = []
+    if allow_origins_raw:
+        allow_origins = [o.strip() for o in str(allow_origins_raw).split(",") if o.strip()]
+
+    return {
+        "allow_origins": allow_origins,
+        "allow_origin_regex": str(allow_origin_regex or ""),
+        "allow_headers": [h.strip().lower() for h in str(allow_headers_raw).split(",") if h.strip()],
+        "allow_methods": [m.strip().upper() for m in str(allow_methods_raw).split(",") if m.strip()],
+        "allow_credentials": allow_credentials,
+        "auto_allow_origin_from_host": auto_allow_origin_from_host,
+        "max_age": max_age,
+        "allow_private_network": allow_private_network,
+    }
+
+
+def _cors_headers_for_request(request: Request, *, cors: dict) -> dict[str, str]:
+    """
+    Minimal CORS preflight support for browser-based MCP clients (SSE).
+    """
+    origin = request.headers.get("origin")
+    headers: dict[str, str] = {
+        "Access-Control-Allow-Methods": ", ".join(cors["allow_methods"]),
+        "Access-Control-Max-Age": str(cors["max_age"]),
+    }
+
+    requested_headers = request.headers.get("access-control-request-headers")
+    if requested_headers:
+        headers["Access-Control-Allow-Headers"] = requested_headers
+    else:
+        headers["Access-Control-Allow-Headers"] = ", ".join(cors["allow_headers"])
+
+    if cors["allow_private_network"] and request.headers.get("access-control-request-private-network") == "true":
+        headers["Access-Control-Allow-Private-Network"] = "true"
+
+    if not origin:
+        return headers
+
+    allowed = False
+    allow_origins: list[str] = cors["allow_origins"]
+    allow_origin_regex: str = cors["allow_origin_regex"]
+    if "*" in allow_origins:
+        allowed = True
+    elif origin in allow_origins:
+        allowed = True
+    elif allow_origin_regex:
+        try:
+            if re.match(allow_origin_regex, origin):
+                allowed = True
+        except re.error:
+            # Bad regex config: treat as disallowed rather than failing requests.
+            allowed = False
+
+    # Optional: allow same-origin by comparing Origin against Host (as set by nginx)
+    # and inferred scheme (x-forwarded-proto preferred).
+    if not allowed and cors.get("auto_allow_origin_from_host"):
+        try:
+            host = request.headers.get("host") or request.url.netloc
+            scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+            expected_origin = f"{scheme}://{host}"
+            if origin == expected_origin:
+                allowed = True
+        except Exception:
+            allowed = False
+
+    if allowed:
+        # If credentials are allowed, we must echo origin (not "*").
+        if cors["allow_credentials"]:
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+            headers["Access-Control-Allow-Credentials"] = "true"
+        else:
+            headers["Access-Control-Allow-Origin"] = "*" if "*" in allow_origins else origin
+            if "*" not in allow_origins:
+                headers["Vary"] = "Origin"
+
+    return headers
 
 
 async def _process_content_blocks_background(task_id: str, page_uid: str, actions: list):
@@ -1482,6 +1640,9 @@ def create_app():
             app.add_route(path, _oauth_metadata, methods=["GET"])
 
         app.add_route("/oauth/token", _oauth_token, methods=["POST"])
+
+    # Add CORS last so it can decorate even error responses from inner middleware.
+    app.add_middleware(McpCorsMiddleware)
 
     return app
 
