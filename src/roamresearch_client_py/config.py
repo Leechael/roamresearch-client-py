@@ -104,8 +104,9 @@ def init_config_file() -> Path:
 #
 # [[oauth.clients]]
 # id = "local-dev"
-# secret = "dev-secret"
+# secret = "dev-secret"  # Optional for authorization_code+PKCE; required for client_credentials
 # scopes = ["mcp"]
+# redirect_uris = ["http://localhost:6274/oauth/callback"]  # For /authorize (authorization_code)
 
 [batch]
 # size = 100

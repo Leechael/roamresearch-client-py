@@ -15,16 +15,18 @@ from datetime import datetime
 import json
 import re
 import base64
+import hashlib
 import hmac
 import time
 from urllib.parse import parse_qs
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 import pendulum
@@ -319,8 +321,9 @@ def _parse_bool(value, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class OAuthClientConfig:
     client_id: str
-    client_secret: str
+    client_secret: str | None
     scopes: list[str]
+    redirect_uris: list[str]
 
 
 @dataclass(frozen=True)
@@ -363,21 +366,31 @@ def _load_oauth_settings() -> OAuthSettings:
             if not isinstance(item, dict):
                 continue
             cid = str(item.get("id") or "")
-            csecret = str(item.get("secret") or "")
+            raw_secret = item.get("secret")
+            csecret = str(raw_secret) if raw_secret is not None and str(raw_secret) != "" else None
             scopes = item.get("scopes") or []
-            if not cid or not csecret:
+            redirect_uris = item.get("redirect_uris") or []
+            if not cid:
                 continue
             if not isinstance(scopes, list):
                 scopes = [str(scopes)]
             scopes = [str(s).strip() for s in scopes if str(s).strip()]
             if not scopes:
                 scopes = [OAUTH_REQUIRED_SCOPE]
-            clients_by_id[cid] = OAuthClientConfig(client_id=cid, client_secret=csecret, scopes=scopes)
+            if not isinstance(redirect_uris, list):
+                redirect_uris = [str(redirect_uris)]
+            redirect_uris = [str(u).strip() for u in redirect_uris if str(u).strip()]
+            clients_by_id[cid] = OAuthClientConfig(
+                client_id=cid,
+                client_secret=csecret,
+                scopes=scopes,
+                redirect_uris=redirect_uris,
+            )
 
     if enabled and not signing_secret:
         raise ValueError("oauth.enabled=true but oauth.signing_secret is missing")
     if enabled and not clients_by_id:
-        raise ValueError("oauth.enabled=true but oauth.clients is empty (no client_id/secret configured)")
+        raise ValueError("oauth.enabled=true but oauth.clients is empty")
 
     return OAuthSettings(
         enabled=enabled,
@@ -438,6 +451,20 @@ def _jwt_decode(token: str, secret: str) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("invalid_token: bad payload")
     return payload
+
+
+def _sha256_b64url(raw: str) -> str:
+    digest = hashlib.sha256(raw.encode("utf-8")).digest()
+    return _b64url_encode(digest)
+
+
+def _append_query(url: str, params: dict[str, str]) -> str:
+    parts = urlsplit(url)
+    existing = parse_qs(parts.query, keep_blank_values=True)
+    for k, v in params.items():
+        existing[k] = [v]
+    query = urlencode(existing, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
 def _extract_bearer_token(request: Request, *, allow_query: bool) -> str | None:
@@ -1540,12 +1567,111 @@ def create_app():
             return JSONResponse(
                 {
                     "issuer": issuer,
+                    "authorization_endpoint": f"{issuer}/authorize",
                     "token_endpoint": f"{issuer}/oauth/token",
-                    "grant_types_supported": ["client_credentials"],
-                    "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+                    "grant_types_supported": ["client_credentials", "authorization_code"],
+                    "response_types_supported": ["code"],
+                    "code_challenge_methods_supported": ["S256"],
+                    "token_endpoint_auth_methods_supported": [
+                        "client_secret_basic",
+                        "client_secret_post",
+                        "none",
+                    ],
                     "scopes_supported": settings.scopes_supported,
                 }
             )
+
+        used_auth_codes: dict[str, int] = {}
+
+        def _purge_used_codes(now: int):
+            # Keep dict small; auth codes are very short-lived.
+            expired = [k for k, exp in used_auth_codes.items() if exp <= now]
+            for k in expired:
+                used_auth_codes.pop(k, None)
+
+        def _mark_code_used(jti: str, exp: int, now: int) -> bool:
+            _purge_used_codes(now)
+            if jti in used_auth_codes:
+                return False
+            used_auth_codes[jti] = exp
+            return True
+
+        def _oauth_error_redirect(redirect_uri: str, *, error: str, desc: str | None, state: str | None) -> Response:
+            params = {"error": error}
+            if desc:
+                params["error_description"] = desc
+            if state:
+                params["state"] = state
+            return RedirectResponse(_append_query(redirect_uri, params), status_code=302)
+
+        async def _oauth_authorize(request: Request) -> Response:
+            qp = request.query_params
+            response_type = (qp.get("response_type") or "").strip()
+            client_id = (qp.get("client_id") or "").strip()
+            redirect_uri = (qp.get("redirect_uri") or "").strip()
+            state = (qp.get("state") or "").strip() or None
+            requested_scope = (qp.get("scope") or "").strip()
+            code_challenge = (qp.get("code_challenge") or "").strip()
+            code_challenge_method = (qp.get("code_challenge_method") or "").strip()
+
+            if response_type != "code":
+                return PlainTextResponse("unsupported_response_type", status_code=400)
+            if not client_id:
+                return PlainTextResponse("invalid_request: missing client_id", status_code=400)
+            client = settings.clients_by_id.get(client_id)
+            if not client:
+                return PlainTextResponse("unauthorized_client", status_code=400)
+            if not redirect_uri:
+                return PlainTextResponse("invalid_request: missing redirect_uri", status_code=400)
+            if not client.redirect_uris or redirect_uri not in client.redirect_uris:
+                # If redirect is not allowed, don't redirect (avoid open redirect).
+                return PlainTextResponse("invalid_request: redirect_uri not allowed", status_code=400)
+
+            if code_challenge_method != "S256" or not code_challenge:
+                return _oauth_error_redirect(
+                    redirect_uri,
+                    error="invalid_request",
+                    desc="PKCE S256 required (code_challenge + code_challenge_method=S256)",
+                    state=state,
+                )
+
+            if requested_scope:
+                requested_scopes = [s for s in requested_scope.split() if s]
+                if any(s not in client.scopes for s in requested_scopes):
+                    return _oauth_error_redirect(
+                        redirect_uri,
+                        error="invalid_scope",
+                        desc="Requested scope not allowed for client",
+                        state=state,
+                    )
+                scope = " ".join(requested_scopes)
+            else:
+                scope = " ".join(client.scopes)
+
+            issuer = _request_issuer(request)
+            now = int(time.time())
+            exp = now + 120
+            jti = uuid.uuid4().hex
+            code = _jwt_encode(
+                {
+                    "iss": issuer,
+                    "aud": "oauth-code",
+                    "iat": now,
+                    "exp": exp,
+                    "jti": jti,
+                    "client_id": client.client_id,
+                    "redirect_uri": redirect_uri,
+                    "scope": scope,
+                    "code_challenge": code_challenge,
+                    "code_challenge_method": "S256",
+                },
+                settings.signing_secret,
+            )
+
+            params = {"code": code}
+            if state:
+                params["state"] = state
+            return RedirectResponse(_append_query(redirect_uri, params), status_code=302)
 
         async def _oauth_token(request: Request) -> Response:
             # RFC 6749: x-www-form-urlencoded
@@ -1564,15 +1690,15 @@ def create_app():
                 params = {k: (v[-1] if v else "") for k, v in parsed.items()}
 
             grant_type = (params.get("grant_type") or "").strip()
-            if grant_type != "client_credentials":
+            if grant_type not in {"client_credentials", "authorization_code"}:
                 return JSONResponse(
-                    {"error": "unsupported_grant_type", "error_description": "Only client_credentials is supported"},
+                    {"error": "unsupported_grant_type", "error_description": "Supported: client_credentials, authorization_code"},
                     status_code=400,
                 )
 
-            # Client authentication: Basic or client_secret_post
+            # Client authentication: Basic or client_secret_post or none (public client for auth code)
             client_id = ""
-            client_secret = ""
+            client_secret: str | None = None
             auth = request.headers.get("authorization") or ""
             if auth.lower().startswith("basic "):
                 try:
@@ -1585,27 +1711,100 @@ def create_app():
                     )
             else:
                 client_id = (params.get("client_id") or "").strip()
-                client_secret = (params.get("client_secret") or "").strip()
+                raw_secret = (params.get("client_secret") or "").strip()
+                client_secret = raw_secret or None
 
             client = settings.clients_by_id.get(client_id)
-            if not client or not hmac.compare_digest(client.client_secret, client_secret):
+            if not client:
                 return JSONResponse(
-                    {"error": "invalid_client", "error_description": "Unknown client or bad secret"},
+                    {"error": "invalid_client", "error_description": "Unknown client"},
                     status_code=401,
                 )
 
-            requested_scope = (params.get("scope") or "").strip()
-            if requested_scope:
-                requested_scopes = [s for s in requested_scope.split() if s]
-                if any(s not in client.scopes for s in requested_scopes):
+            if grant_type == "client_credentials":
+                if not client.client_secret:
                     return JSONResponse(
-                        {"error": "invalid_scope", "error_description": "Requested scope not allowed for client"},
+                        {"error": "invalid_client", "error_description": "Client has no secret; client_credentials not allowed"},
+                        status_code=401,
+                    )
+                if not client_secret or not hmac.compare_digest(client.client_secret, client_secret):
+                    return JSONResponse(
+                        {"error": "invalid_client", "error_description": "Bad secret"},
+                        status_code=401,
+                    )
+
+                requested_scope = (params.get("scope") or "").strip()
+                if requested_scope:
+                    requested_scopes = [s for s in requested_scope.split() if s]
+                    if any(s not in client.scopes for s in requested_scopes):
+                        return JSONResponse(
+                            {"error": "invalid_scope", "error_description": "Requested scope not allowed for client"},
+                            status_code=400,
+                        )
+                    scope = " ".join(requested_scopes)
+                else:
+                    scope = " ".join(client.scopes)
+
+            else:
+                # authorization_code + PKCE (S256)
+                code = (params.get("code") or "").strip()
+                redirect_uri = (params.get("redirect_uri") or "").strip()
+                code_verifier = (params.get("code_verifier") or "").strip()
+
+                if not code or not redirect_uri or not code_verifier:
+                    return JSONResponse(
+                        {"error": "invalid_request", "error_description": "Missing code, redirect_uri, or code_verifier"},
                         status_code=400,
                     )
-                scope = " ".join(requested_scopes)
-            else:
-                # Default: grant all client scopes.
-                scope = " ".join(client.scopes)
+
+                # If the client has a secret configured, require it (confidential client).
+                if client.client_secret:
+                    if not client_secret or not hmac.compare_digest(client.client_secret, client_secret):
+                        return JSONResponse(
+                            {"error": "invalid_client", "error_description": "Bad secret"},
+                            status_code=401,
+                        )
+
+                try:
+                    code_payload = _jwt_decode(code, settings.signing_secret)
+                except Exception:
+                    return JSONResponse(
+                        {"error": "invalid_grant", "error_description": "Invalid code"},
+                        status_code=400,
+                    )
+
+                now = int(time.time())
+                if code_payload.get("aud") != "oauth-code":
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Bad code audience"}, status_code=400)
+                exp = code_payload.get("exp")
+                if not isinstance(exp, int) or exp <= now:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Code expired"}, status_code=400)
+
+                issuer = _request_issuer(request)
+                if code_payload.get("iss") != issuer:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Bad code issuer"}, status_code=400)
+
+                if code_payload.get("client_id") != client.client_id:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Code client mismatch"}, status_code=400)
+                if code_payload.get("redirect_uri") != redirect_uri:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
+
+                if code_payload.get("code_challenge_method") != "S256":
+                    return JSONResponse({"error": "invalid_grant", "error_description": "PKCE S256 required"}, status_code=400)
+                expected = code_payload.get("code_challenge") or ""
+                if not isinstance(expected, str) or not expected:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Missing code_challenge"}, status_code=400)
+                actual = _sha256_b64url(code_verifier)
+                if not hmac.compare_digest(expected, actual):
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Bad code_verifier"}, status_code=400)
+
+                jti = code_payload.get("jti") or ""
+                if not isinstance(jti, str) or not jti:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Bad code jti"}, status_code=400)
+                if not _mark_code_used(jti, exp, now):
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Code already used"}, status_code=400)
+
+                scope = str(code_payload.get("scope") or "").strip() or " ".join(client.scopes)
 
             issuer = _request_issuer(request)
             now = int(time.time())
@@ -1638,6 +1837,9 @@ def create_app():
             "/mcp/.well-known/oauth-authorization-server",
         ):
             app.add_route(path, _oauth_metadata, methods=["GET"])
+
+        for path in ("/authorize", "/oauth/authorize"):
+            app.add_route(path, _oauth_authorize, methods=["GET"])
 
         app.add_route("/oauth/token", _oauth_token, methods=["POST"])
 

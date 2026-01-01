@@ -74,7 +74,7 @@ def _settings_for_middleware_tests() -> server.OAuthSettings:
         access_token_ttl_seconds=3600,
         scopes_supported=["mcp"],
         clients_by_id={
-            "c1": server.OAuthClientConfig(client_id="c1", client_secret="s1", scopes=["mcp"]),
+            "c1": server.OAuthClientConfig(client_id="c1", client_secret="s1", scopes=["mcp"], redirect_uris=[]),
         },
     )
 

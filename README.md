@@ -109,13 +109,14 @@ Endpoints (default host `127.0.0.1`, port `9000`):
   - Event stream: `http://127.0.0.1:9000/sse`
   - Client messages: `http://127.0.0.1:9000/messages`
 
-Optional OAuth 2.0 (client credentials, config-only; no users/DB):
+Optional OAuth 2.0 (config-only; no users/DB):
 
 - Discovery (some clients probe multiple variants):
   - `http://127.0.0.1:9000/.well-known/oauth-authorization-server`
   - `http://127.0.0.1:9000/.well-known/oauth-authorization-server/mcp`
   - `http://127.0.0.1:9000/mcp/.well-known/oauth-authorization-server`
 - Token endpoint: `http://127.0.0.1:9000/oauth/token`
+- Authorization endpoint (for `authorization_code` + PKCE): `http://127.0.0.1:9000/authorize`
 
 Enable in `~/.config/roamresearch-client-py/config.toml`:
 
@@ -128,14 +129,15 @@ signing_secret = "change-me-long-random"
 
 [[oauth.clients]]
 id = "local-dev"
-secret = "dev-secret"
+secret = "dev-secret" # optional if using authorization_code+PKCE
 scopes = ["mcp"]
+redirect_uris = ["http://localhost:6274/oauth/callback"]
 ```
 
 Notes:
 
 - Disable/skip OAuth: set `[oauth].enabled = false` (default). No `oauth.clients` needed.
-- `oauth.clients` is a static allowlist of OAuth2 `client_id`/`client_secret` pairs that can call `/oauth/token`.
+- `oauth.clients` is a static allowlist of OAuth2 clients; `secret` is required for `client_credentials` and optional for `authorization_code` (PKCE public clients).
 - Multiple clients are supported by adding multiple `[[oauth.clients]]` sections.
 
 Browser CORS / preflight:
