@@ -111,7 +111,11 @@ Endpoints (default host `127.0.0.1`, port `9000`):
 
 Optional OAuth 2.0 (config-only; no users/DB):
 
-- Discovery (some clients probe multiple variants):
+- Protected Resource Metadata (RFC 9728):
+  - `http://127.0.0.1:9000/.well-known/oauth-protected-resource`
+  - `http://127.0.0.1:9000/.well-known/oauth-protected-resource/mcp`
+  - `http://127.0.0.1:9000/mcp/.well-known/oauth-protected-resource`
+- Authorization Server Metadata (RFC 8414):
   - `http://127.0.0.1:9000/.well-known/oauth-authorization-server`
   - `http://127.0.0.1:9000/.well-known/oauth-authorization-server/mcp`
   - `http://127.0.0.1:9000/mcp/.well-known/oauth-authorization-server`
@@ -128,10 +132,10 @@ allow_access_token_query = false
 signing_secret = "change-me-long-random"
 
 [[oauth.clients]]
-id = "local-dev"
-secret = "dev-secret" # optional if using authorization_code+PKCE
+id = "claude"
+secret = ""  # empty for public client (authorization_code + PKCE)
 scopes = ["mcp"]
-redirect_uris = ["http://localhost:6274/oauth/callback"]
+redirect_uris = ["https://claude.ai/api/mcp/auth_callback"]
 ```
 
 Notes:

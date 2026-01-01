@@ -478,11 +478,19 @@ def _extract_bearer_token(request: Request, *, allow_query: bool) -> str | None:
     return None
 
 
-def _unauthorized(detail: str = "Unauthorized") -> Response:
+def _unauthorized(detail: str = "Unauthorized", *, request: Request | None = None) -> Response:
+    """Return 401 response with WWW-Authenticate header per RFC 9728."""
+    if request is not None:
+        issuer = _request_issuer(request)
+        resource_metadata_url = f"{issuer}/.well-known/oauth-protected-resource"
+        www_auth = f'Bearer realm="{resource_metadata_url}"'
+    else:
+        www_auth = 'Bearer realm="mcp"'
+    logger.debug(f"OAuth 401: {detail} | WWW-Authenticate: {www_auth}")
     return PlainTextResponse(
         detail,
         status_code=401,
-        headers={"WWW-Authenticate": 'Bearer realm="mcp"'},
+        headers={"WWW-Authenticate": www_auth},
     )
 
 
@@ -500,12 +508,14 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         path = request.url.path
-        # Always allow oauth discovery + token endpoint without auth.
-        if path.startswith("/.well-known/oauth-authorization-server"):
+        # Always allow OAuth discovery, protected resource metadata, and token endpoints without auth.
+        if path.startswith("/.well-known/oauth-"):
             return await call_next(request)
-        if path.startswith("/mcp/.well-known/oauth-authorization-server"):
+        if path.startswith("/mcp/.well-known/oauth-"):
             return await call_next(request)
         if path == "/oauth/token":
+            return await call_next(request)
+        if path in ("/authorize", "/oauth/authorize"):
             return await call_next(request)
 
         protected = path == "/mcp" or path.startswith("/sse") or path.startswith("/messages")
@@ -514,29 +524,36 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
 
         token = _extract_bearer_token(request, allow_query=self.settings.allow_access_token_query)
         if not token:
-            return _unauthorized("Missing Bearer token")
+            logger.info(f"OAuth: No token in request to {path}")
+            return _unauthorized("Missing Bearer token", request=request)
 
         try:
             payload = _jwt_decode(token, self.settings.signing_secret)
         except Exception as e:
-            return _unauthorized(str(e))
+            logger.warning(f"OAuth: Token decode failed for {path}: {e}")
+            return _unauthorized(str(e), request=request)
 
         now = int(time.time())
         exp = payload.get("exp")
         if not isinstance(exp, int) or exp <= now:
-            return _unauthorized("invalid_token: expired")
+            logger.warning(f"OAuth: Token expired for {path}")
+            return _unauthorized("invalid_token: expired", request=request)
 
         if payload.get("aud") != self.settings.audience:
-            return _unauthorized("invalid_token: bad audience")
+            logger.warning(f"OAuth: Bad audience for {path}: got {payload.get('aud')}, expected {self.settings.audience}")
+            return _unauthorized("invalid_token: bad audience", request=request)
 
         # issuer is request-derived (host-based) so tokens are bound to the served host.
-        if payload.get("iss") != _request_issuer(request):
-            return _unauthorized("invalid_token: bad issuer")
+        expected_issuer = _request_issuer(request)
+        if payload.get("iss") != expected_issuer:
+            logger.warning(f"OAuth: Bad issuer for {path}: got {payload.get('iss')}, expected {expected_issuer}")
+            return _unauthorized("invalid_token: bad issuer", request=request)
 
         scope = payload.get("scope") or ""
         scopes = set(str(scope).split())
         if OAUTH_REQUIRED_SCOPE not in scopes:
-            return _unauthorized("insufficient_scope")
+            logger.warning(f"OAuth: Insufficient scope for {path}: got {scopes}, need {OAUTH_REQUIRED_SCOPE}")
+            return _unauthorized("insufficient_scope", request=request)
 
         return await call_next(request)
 
@@ -1562,6 +1579,17 @@ def create_app():
     if settings.enabled:
         app.add_middleware(OAuthAuthMiddleware, settings=settings)
 
+        def _oauth_protected_resource_metadata(request: Request) -> Response:
+            """OAuth 2.0 Protected Resource Metadata (RFC 9728)."""
+            issuer = _request_issuer(request)
+            logger.debug(f"OAuth: Serving protected resource metadata for issuer={issuer}")
+            return JSONResponse({
+                "resource": issuer,
+                "authorization_servers": [issuer],
+                "scopes_supported": settings.scopes_supported,
+                "bearer_methods_supported": ["header"],
+            })
+
         def _oauth_metadata(request: Request) -> Response:
             issuer = _request_issuer(request)
             return JSONResponse(
@@ -1614,17 +1642,24 @@ def create_app():
             code_challenge = (qp.get("code_challenge") or "").strip()
             code_challenge_method = (qp.get("code_challenge_method") or "").strip()
 
+            logger.info(f"OAuth /authorize: client_id={client_id}, response_type={response_type}, redirect_uri={redirect_uri}, scope={requested_scope}")
+
             if response_type != "code":
+                logger.warning(f"OAuth /authorize: unsupported response_type={response_type}")
                 return PlainTextResponse("unsupported_response_type", status_code=400)
             if not client_id:
+                logger.warning("OAuth /authorize: missing client_id")
                 return PlainTextResponse("invalid_request: missing client_id", status_code=400)
             client = settings.clients_by_id.get(client_id)
             if not client:
+                logger.warning(f"OAuth /authorize: unknown client_id={client_id}, known clients: {list(settings.clients_by_id.keys())}")
                 return PlainTextResponse("unauthorized_client", status_code=400)
             if not redirect_uri:
+                logger.warning("OAuth /authorize: missing redirect_uri")
                 return PlainTextResponse("invalid_request: missing redirect_uri", status_code=400)
             if not client.redirect_uris or redirect_uri not in client.redirect_uris:
                 # If redirect is not allowed, don't redirect (avoid open redirect).
+                logger.warning(f"OAuth /authorize: redirect_uri not allowed: {redirect_uri}, allowed: {client.redirect_uris}")
                 return PlainTextResponse("invalid_request: redirect_uri not allowed", status_code=400)
 
             if code_challenge_method != "S256" or not code_challenge:
@@ -1671,6 +1706,7 @@ def create_app():
             params = {"code": code}
             if state:
                 params["state"] = state
+            logger.info(f"OAuth /authorize: issuing code for client_id={client_id}, scope={scope}, redirect_uri={redirect_uri}")
             return RedirectResponse(_append_query(redirect_uri, params), status_code=302)
 
         async def _oauth_token(request: Request) -> Response:
@@ -1690,7 +1726,9 @@ def create_app():
                 params = {k: (v[-1] if v else "") for k, v in parsed.items()}
 
             grant_type = (params.get("grant_type") or "").strip()
+            logger.info(f"OAuth /token: grant_type={grant_type}, client_id={params.get('client_id', '(from auth header)')}")
             if grant_type not in {"client_credentials", "authorization_code"}:
+                logger.warning(f"OAuth /token: unsupported grant_type={grant_type}")
                 return JSONResponse(
                     {"error": "unsupported_grant_type", "error_description": "Supported: client_credentials, authorization_code"},
                     status_code=400,
@@ -1716,6 +1754,7 @@ def create_app():
 
             client = settings.clients_by_id.get(client_id)
             if not client:
+                logger.warning(f"OAuth /token: unknown client_id={client_id}, known clients: {list(settings.clients_by_id.keys())}")
                 return JSONResponse(
                     {"error": "invalid_client", "error_description": "Unknown client"},
                     status_code=401,
@@ -1821,6 +1860,7 @@ def create_app():
                 settings.signing_secret,
             )
 
+            logger.info(f"OAuth /token: issued access_token for client_id={client.client_id}, scope={scope}, expires_in={settings.access_token_ttl_seconds}s")
             return JSONResponse(
                 {
                     "access_token": token,
@@ -1830,7 +1870,16 @@ def create_app():
                 }
             )
 
-        # OAuth discovery endpoints (multiple variants for client probing)
+        # OAuth 2.0 Protected Resource Metadata (RFC 9728)
+        # Clients discover authorization by fetching this endpoint
+        for path in (
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+            "/mcp/.well-known/oauth-protected-resource",
+        ):
+            app.add_route(path, _oauth_protected_resource_metadata, methods=["GET"])
+
+        # OAuth Authorization Server Metadata (RFC 8414)
         for path in (
             "/.well-known/oauth-authorization-server",
             "/.well-known/oauth-authorization-server/mcp",
