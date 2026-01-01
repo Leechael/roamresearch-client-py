@@ -531,7 +531,7 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
             payload = _jwt_decode(token, self.settings.signing_secret)
         except Exception as e:
             logger.warning(f"OAuth: Token decode failed for {path}: {e}")
-            return _unauthorized(str(e), request=request)
+            return _unauthorized("invalid_token: malformed", request=request)
 
         now = int(time.time())
         exp = payload.get("exp")
@@ -661,7 +661,11 @@ def _cors_headers_for_request(request: Request, *, cors: dict) -> dict[str, str]
 
     requested_headers = request.headers.get("access-control-request-headers")
     if requested_headers:
-        headers["Access-Control-Allow-Headers"] = requested_headers
+        # Validate requested headers against configured allow_headers whitelist
+        allowed_headers_set = set(cors["allow_headers"])
+        requested_list = [h.strip().lower() for h in requested_headers.split(",") if h.strip()]
+        validated = [h for h in requested_list if h in allowed_headers_set]
+        headers["Access-Control-Allow-Headers"] = ", ".join(validated) if validated else ", ".join(cors["allow_headers"])
     else:
         headers["Access-Control-Allow-Headers"] = ", ".join(cors["allow_headers"])
 
@@ -1609,6 +1613,9 @@ def create_app():
                 }
             )
 
+        # NOTE: In-memory store for used authorization codes. This only works correctly
+        # in single-worker deployments. For multi-worker setups, a shared store (Redis,
+        # database) would be needed to prevent auth code replay across workers.
         used_auth_codes: dict[str, int] = {}
 
         def _purge_used_codes(now: int):

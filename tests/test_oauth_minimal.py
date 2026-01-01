@@ -173,3 +173,28 @@ async def test_middleware_does_not_require_token_when_require_auth_false():
 
     resp = await middleware.dispatch(req, call_next)
     assert resp.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_middleware_returns_generic_error_for_malformed_token():
+    """Malformed tokens should return generic error, not leak exception details."""
+    settings = _settings_for_middleware_tests()
+
+    # Token with invalid base64 in payload
+    malformed_token = "eyJhbGciOiJIUzI1NiJ9.!!!invalid-base64!!!.sig"
+    req = _request_for_middleware(
+        headers=[(b"authorization", f"Bearer {malformed_token}".encode("ascii"))],
+        path="/mcp",
+    )
+    middleware = server.OAuthAuthMiddleware(lambda scope, receive, send: None, settings=settings)
+
+    async def call_next(_request):
+        return server.PlainTextResponse("ok")
+
+    resp = await middleware.dispatch(req, call_next)
+    assert resp.status_code == 401
+    # Should return generic message, not leak binascii.Error or JSONDecodeError details
+    body = resp.body.decode("utf-8")
+    assert "invalid_token: malformed" in body
+    assert "binascii" not in body.lower()
+    assert "json" not in body.lower()
