@@ -2,6 +2,7 @@ from typing import cast, List, Dict, Any, Literal
 from itertools import chain
 import uuid
 import logging
+import re
 
 import mistune
 
@@ -10,6 +11,53 @@ from .structs import Block, BlockRef
 
 parse = mistune.create_markdown(renderer=None, plugins=['table'])
 logger = logging.getLogger(__name__)
+
+_TASK_MARKER_RE = re.compile(
+    r"^(?P<leading>\s*)"
+    r"(?:(?P<number>\d+\.)\s+|(?P<bullet>[-*+])\s+)?"
+    r"\[\s*(?P<mark>[xX]?)\s*\]\s*"
+    r"(?P<rest>.*)$"
+)
+
+
+def normalize_task_marker(text: str) -> str:
+    """
+    Convert GitHub-style task list markers into Roam TODO/DONE macros.
+
+    Examples:
+      - "[ ] task"      -> "{{[[TODO]]}} task"
+      - "- [x] task"    -> "{{[[DONE]]}} task"
+      - "1. [X] task"   -> "1. {{[[DONE]]}} task"
+
+    Bullet prefixes (-/*/+) are dropped; numbered prefixes are preserved.
+    """
+    m = _TASK_MARKER_RE.match(text)
+    if not m:
+        return text
+
+    # Require the marker to appear at the start (after optional list prefix).
+    # Avoid converting arbitrary bracketed text by requiring at least one space
+    # or list prefix before the marker (handled by regex), or that the marker
+    # begins the string.
+    mark = (m.group("mark") or "").strip()
+    macro = "{{[[DONE]]}}" if mark.lower() == "x" else "{{[[TODO]]}}"
+
+    leading = m.group("leading") or ""
+    number = m.group("number")
+    rest = (m.group("rest") or "").lstrip()
+
+    prefix = f"{leading}{number} " if number else leading
+    if rest:
+        return f"{prefix}{macro} {rest}".rstrip()
+    return f"{prefix}{macro}".rstrip()
+
+
+def _normalize_block_text(block: Block) -> Block:
+    # Don't rewrite quoted/code-like blocks.
+    if block.text.startswith(("```", "> ")):
+        return block
+    block.text = normalize_task_marker(block.text)
+    return block
 
 
 def parse_file(path_str: str):
@@ -71,7 +119,7 @@ def ast_to_block(
             items = [ast_to_inline(i) for i in ast['children']]
             blk = Block(''.join(items), parent_ref)
             blk.heading = ast['attrs']['level']
-            return [blk]
+            return [_normalize_block_text(blk)]
 
         case 'list':
             nested = [ast_to_block(i, parent_ref) for i in ast['children']]
@@ -89,15 +137,15 @@ def ast_to_block(
             cur, = ast_to_block(ast['children'][0], parent_ref)
             cur.text = f'{prefix}{cur.text}'
             nested = [ast_to_block(i, cur.ref) for i in ast['children'][1:]]
-            return [cur] + list(chain(*nested))
+            return [_normalize_block_text(cur)] + list(chain(*nested))
 
         case 'block_text':
             items = [ast_to_inline(i) for i in ast['children']]
-            return [Block("".join(items), parent_ref)]
+            return [_normalize_block_text(Block("".join(items), parent_ref))]
 
         case 'paragraph':
             items = [ast_to_inline(i) for i in ast['children']]
-            return [Block("".join(items), parent_ref)]
+            return [_normalize_block_text(Block("".join(items), parent_ref))]
 
         case 'blank_line':
             # return [create_block("", pid, gen_uid())]
@@ -144,10 +192,10 @@ def ast_to_block(
         case 'block_code':
             lang = ast.get('attrs', {}).get('info', '')
             code = ast.get('raw', '')
-            return [Block(f"```{lang}\n{code}\n```", parent_ref)]
+            return [_normalize_block_text(Block(f"```{lang}\n{code}\n```", parent_ref))]
 
         case 'thematic_break':
-            return [Block("---", parent_ref)]
+            return [_normalize_block_text(Block("---", parent_ref))]
 
         case 'block_quote':
             if len(ast.get("children", [])) > 1 or ast["children"][0].get("type") != 'paragraph':
@@ -155,7 +203,7 @@ def ast_to_block(
                 return []
             blk, = ast_to_block(ast["children"][0], parent_ref)
             blk.text = f"> {blk.text}"
-            return [blk]
+            return [_normalize_block_text(blk)]
 
     logger.warn(f"unsupported block type: {ast['type']}")
 

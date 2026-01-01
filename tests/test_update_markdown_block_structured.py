@@ -61,6 +61,18 @@ def test_gfm_to_blocks_skip_h1_false_keeps_h1_and_nests_children():
     assert blocks[1].parent_ref == blocks[0].ref
 
 
+def test_gfm_to_blocks_converts_task_markers_to_roam_todo_done():
+    page_uid = "page"
+    blocks = gfm_to_blocks("- [ ] a\n- [x] b\n- [X] c\n", page_uid)
+    assert [b.text for b in blocks] == ["{{[[TODO]]}} a", "{{[[DONE]]}} b", "{{[[DONE]]}} c"]
+
+
+def test_gfm_to_blocks_converts_task_markers_in_ordered_list():
+    page_uid = "page"
+    blocks = gfm_to_blocks("1. [ ] a\n2. [x] b\n", page_uid)
+    assert [b.text for b in blocks] == ["1. {{[[TODO]]}} a", "2. {{[[DONE]]}} b"]
+
+
 class _FakeRoamClient:
     def __init__(self, *, block_by_uid: dict | None = None):
         self._block_by_uid = block_by_uid
@@ -94,6 +106,17 @@ async def test_update_markdown_block_plain_text_uses_update_block_text(monkeypat
     result = await server.update_markdown("abc123", "just a line", False)
     assert "Updated:" in result
     assert fake.update_block_text_calls == [("abc123", "just a line", False)]
+    assert fake.batch_actions_calls == []
+
+
+@pytest.mark.anyio
+async def test_update_markdown_block_plain_text_converts_task_marker(monkeypatch):
+    fake = _FakeRoamClient()
+    monkeypatch.setattr(server, "RoamClient", lambda: fake)
+
+    result = await server.update_markdown("abc123", "[ ] task", False)
+    assert "Updated:" in result
+    assert fake.update_block_text_calls == [("abc123", "{{[[TODO]]}} task", False)]
     assert fake.batch_actions_calls == []
 
 

@@ -23,7 +23,7 @@ import pendulum
 from .client import RoamClient, create_page, create_block
 from .config import get_env_or_config, get_config_dir
 from .formatter import format_block, format_block_as_markdown, extract_ref, expand_refs_in_text
-from .gfm_to_roam import gfm_to_batch_actions, gfm_to_blocks
+from .gfm_to_roam import gfm_to_batch_actions, gfm_to_blocks, normalize_task_marker
 from .diff import parse_existing_blocks, diff_block_trees, generate_batch_actions
 
 
@@ -969,7 +969,7 @@ async def update_markdown(identifier: str, markdown: str, dry_run: bool = False)
 
             if not _should_parse_block_update_as_markdown(text):
                 # Single block update (plain text)
-                result = await client.update_block_text(uid, text, dry_run=dry_run)
+                result = await client.update_block_text(uid, normalize_task_marker(text), dry_run=dry_run)
                 stats = result["stats"]
                 prefix = "Dry run - would make" if dry_run else "Updated"
                 return f"{prefix}: {stats['updates']} updates"
@@ -981,6 +981,7 @@ async def update_markdown(identifier: str, markdown: str, dry_run: bool = False)
                 return f"Error: Block not found: {uid}"
 
             root_text, root_heading, children_markdown = _split_root_and_children_markdown(text)
+            root_text = normalize_task_marker(root_text)
 
             existing_text = existing_block.get(":block/string", "")
             existing_heading = existing_block.get(":block/heading")
