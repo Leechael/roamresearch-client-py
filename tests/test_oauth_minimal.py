@@ -69,6 +69,7 @@ def _settings_for_middleware_tests() -> server.OAuthSettings:
         enabled=True,
         require_auth=True,
         allow_access_token_query=False,
+        allow_dynamic_registration=False,
         audience="test-aud",
         signing_secret="test-secret",
         access_token_ttl_seconds=3600,

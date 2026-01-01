@@ -331,6 +331,7 @@ class OAuthSettings:
     enabled: bool
     require_auth: bool
     allow_access_token_query: bool
+    allow_dynamic_registration: bool
     audience: str
     signing_secret: str
     access_token_ttl_seconds: int
@@ -344,6 +345,10 @@ def _load_oauth_settings() -> OAuthSettings:
     allow_access_token_query = _parse_bool(
         get_env_or_config("OAUTH_ALLOW_ACCESS_TOKEN_QUERY", "oauth.allow_access_token_query", False),
         False,
+    )
+    allow_dynamic_registration = _parse_bool(
+        get_env_or_config("OAUTH_ALLOW_DYNAMIC_REGISTRATION", "oauth.allow_dynamic_registration", True),
+        True,
     )
     audience = str(get_env_or_config("OAUTH_AUDIENCE", "oauth.audience", "roamresearch-mcp"))
     signing_secret = str(get_env_or_config("OAUTH_SIGNING_SECRET", "oauth.signing_secret", "") or "")
@@ -389,13 +394,14 @@ def _load_oauth_settings() -> OAuthSettings:
 
     if enabled and not signing_secret:
         raise ValueError("oauth.enabled=true but oauth.signing_secret is missing")
-    if enabled and not clients_by_id:
-        raise ValueError("oauth.enabled=true but oauth.clients is empty")
+    if enabled and not clients_by_id and not allow_dynamic_registration:
+        raise ValueError("oauth.enabled=true but oauth.clients is empty and dynamic registration is disabled")
 
     return OAuthSettings(
         enabled=enabled,
         require_auth=require_auth,
         allow_access_token_query=allow_access_token_query,
+        allow_dynamic_registration=allow_dynamic_registration,
         audience=audience,
         signing_secret=signing_secret,
         access_token_ttl_seconds=access_token_ttl_seconds,
@@ -513,7 +519,7 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if path.startswith("/mcp/.well-known/oauth-"):
             return await call_next(request)
-        if path == "/oauth/token":
+        if path in ("/oauth/token", "/oauth/register"):
             return await call_next(request)
         if path in ("/authorize", "/oauth/authorize"):
             return await call_next(request)
@@ -1576,7 +1582,6 @@ async def get_journaling_by_date(when=None):
 
 def create_app():
     app = mcp.streamable_http_app()
-    # FIXME: mount for SSE endpoint, but missed the authorization middleware.
     app.routes.extend(mcp.sse_app().routes)
 
     settings = _load_oauth_settings()
@@ -1596,27 +1601,36 @@ def create_app():
 
         def _oauth_metadata(request: Request) -> Response:
             issuer = _request_issuer(request)
-            return JSONResponse(
-                {
-                    "issuer": issuer,
-                    "authorization_endpoint": f"{issuer}/authorize",
-                    "token_endpoint": f"{issuer}/oauth/token",
-                    "grant_types_supported": ["client_credentials", "authorization_code"],
-                    "response_types_supported": ["code"],
-                    "code_challenge_methods_supported": ["S256"],
-                    "token_endpoint_auth_methods_supported": [
-                        "client_secret_basic",
-                        "client_secret_post",
-                        "none",
-                    ],
-                    "scopes_supported": settings.scopes_supported,
-                }
-            )
+            metadata: dict = {
+                "issuer": issuer,
+                "authorization_endpoint": f"{issuer}/authorize",
+                "token_endpoint": f"{issuer}/oauth/token",
+                "grant_types_supported": ["client_credentials", "authorization_code"],
+                "response_types_supported": ["code"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": [
+                    "client_secret_basic",
+                    "client_secret_post",
+                    "none",
+                ],
+                "scopes_supported": settings.scopes_supported,
+            }
+            if settings.allow_dynamic_registration:
+                metadata["registration_endpoint"] = f"{issuer}/oauth/register"
+            return JSONResponse(metadata)
 
         # NOTE: In-memory store for used authorization codes. This only works correctly
         # in single-worker deployments. For multi-worker setups, a shared store (Redis,
         # database) would be needed to prevent auth code replay across workers.
         used_auth_codes: dict[str, int] = {}
+
+        # In-memory store for dynamically registered clients (RFC 7591).
+        # Same single-worker caveat as above.
+        dynamic_clients: dict[str, OAuthClientConfig] = {}
+
+        def _get_client(client_id: str) -> OAuthClientConfig | None:
+            """Look up client from static config or dynamic registration."""
+            return settings.clients_by_id.get(client_id) or dynamic_clients.get(client_id)
 
         def _purge_used_codes(now: int):
             # Keep dict small; auth codes are very short-lived.
@@ -1657,9 +1671,9 @@ def create_app():
             if not client_id:
                 logger.warning("OAuth /authorize: missing client_id")
                 return PlainTextResponse("invalid_request: missing client_id", status_code=400)
-            client = settings.clients_by_id.get(client_id)
+            client = _get_client(client_id)
             if not client:
-                logger.warning(f"OAuth /authorize: unknown client_id={client_id}, known clients: {list(settings.clients_by_id.keys())}")
+                logger.warning(f"OAuth /authorize: unknown client_id={client_id}")
                 return PlainTextResponse("unauthorized_client", status_code=400)
             if not redirect_uri:
                 logger.warning("OAuth /authorize: missing redirect_uri")
@@ -1759,9 +1773,9 @@ def create_app():
                 raw_secret = (params.get("client_secret") or "").strip()
                 client_secret = raw_secret or None
 
-            client = settings.clients_by_id.get(client_id)
+            client = _get_client(client_id)
             if not client:
-                logger.warning(f"OAuth /token: unknown client_id={client_id}, known clients: {list(settings.clients_by_id.keys())}")
+                logger.warning(f"OAuth /token: unknown client_id={client_id}")
                 return JSONResponse(
                     {"error": "invalid_client", "error_description": "Unknown client"},
                     status_code=401,
@@ -1877,6 +1891,116 @@ def create_app():
                 }
             )
 
+        async def _oauth_register(request: Request) -> Response:
+            """RFC 7591 Dynamic Client Registration endpoint."""
+            if not settings.allow_dynamic_registration:
+                return JSONResponse(
+                    {"error": "registration_not_supported", "error_description": "Dynamic client registration is disabled"},
+                    status_code=400,
+                )
+
+            content_type = (request.headers.get("content-type") or "").lower()
+            if "application/json" not in content_type:
+                return JSONResponse(
+                    {"error": "invalid_request", "error_description": "Content-Type must be application/json"},
+                    status_code=400,
+                )
+
+            try:
+                body = await request.body()
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except Exception:
+                return JSONResponse(
+                    {"error": "invalid_request", "error_description": "Invalid JSON body"},
+                    status_code=400,
+                )
+
+            if not isinstance(payload, dict):
+                return JSONResponse(
+                    {"error": "invalid_request", "error_description": "Request body must be a JSON object"},
+                    status_code=400,
+                )
+
+            # Extract client metadata
+            redirect_uris = payload.get("redirect_uris") or []
+            if not isinstance(redirect_uris, list):
+                redirect_uris = [str(redirect_uris)]
+            redirect_uris = [str(u).strip() for u in redirect_uris if str(u).strip()]
+
+            # Validate redirect_uris (required for authorization_code flow)
+            if not redirect_uris:
+                return JSONResponse(
+                    {"error": "invalid_redirect_uri", "error_description": "At least one redirect_uri is required"},
+                    status_code=400,
+                )
+
+            # Validate redirect_uri format (must be valid URLs)
+            for uri in redirect_uris:
+                if not uri.startswith(("http://", "https://")):
+                    return JSONResponse(
+                        {"error": "invalid_redirect_uri", "error_description": f"Invalid redirect_uri: {uri}"},
+                        status_code=400,
+                    )
+
+            client_name = payload.get("client_name") or ""
+            grant_types = payload.get("grant_types") or ["authorization_code"]
+            if not isinstance(grant_types, list):
+                grant_types = [str(grant_types)]
+
+            token_endpoint_auth_method = payload.get("token_endpoint_auth_method") or "none"
+
+            # Generate client credentials
+            client_id = uuid.uuid4().hex
+
+            # For public clients (typical for Claude Code), no secret is generated.
+            # For confidential clients, generate a secret.
+            client_secret: str | None = None
+            if token_endpoint_auth_method in ("client_secret_basic", "client_secret_post"):
+                client_secret = uuid.uuid4().hex + uuid.uuid4().hex
+
+            # Determine allowed scopes (default to all supported scopes)
+            requested_scope = payload.get("scope") or ""
+            if requested_scope:
+                scopes = [s.strip() for s in str(requested_scope).split() if s.strip()]
+                # Validate scopes against supported scopes
+                invalid = [s for s in scopes if s not in settings.scopes_supported]
+                if invalid:
+                    return JSONResponse(
+                        {"error": "invalid_client_metadata", "error_description": f"Unsupported scopes: {invalid}"},
+                        status_code=400,
+                    )
+            else:
+                scopes = list(settings.scopes_supported)
+
+            # Create and store the client
+            client_config = OAuthClientConfig(
+                client_id=client_id,
+                client_secret=client_secret,
+                scopes=scopes,
+                redirect_uris=redirect_uris,
+            )
+            dynamic_clients[client_id] = client_config
+
+            logger.info(f"OAuth /register: registered new client client_id={client_id}, redirect_uris={redirect_uris}, scopes={scopes}")
+
+            # Build response per RFC 7591
+            response_payload: dict = {
+                "client_id": client_id,
+                "client_id_issued_at": int(time.time()),
+                "redirect_uris": redirect_uris,
+                "grant_types": grant_types,
+                "token_endpoint_auth_method": token_endpoint_auth_method,
+                "scope": " ".join(scopes),
+            }
+            if client_name:
+                response_payload["client_name"] = client_name
+            if client_secret:
+                response_payload["client_secret"] = client_secret
+                # Secrets don't expire in this implementation
+                response_payload["client_secret_expires_at"] = 0
+
+            return JSONResponse(response_payload, status_code=201)
+
         # OAuth 2.0 Protected Resource Metadata (RFC 9728)
         # Clients discover authorization by fetching this endpoint
         for path in (
@@ -1898,6 +2022,9 @@ def create_app():
             app.add_route(path, _oauth_authorize, methods=["GET"])
 
         app.add_route("/oauth/token", _oauth_token, methods=["POST"])
+
+        if settings.allow_dynamic_registration:
+            app.add_route("/oauth/register", _oauth_register, methods=["POST"])
 
     # Add CORS last so it can decorate even error responses from inner middleware.
     app.add_middleware(McpCorsMiddleware)
