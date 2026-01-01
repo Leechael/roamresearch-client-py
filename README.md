@@ -102,6 +102,42 @@ rr mcp --port 9100
 rr mcp --token <T> --graph <G>
 ```
 
+Endpoints (default host `127.0.0.1`, port `9000`):
+
+- Streamable HTTP: `http://127.0.0.1:9000/mcp`
+- SSE:
+  - Event stream: `http://127.0.0.1:9000/sse`
+  - Client messages: `http://127.0.0.1:9000/messages`
+
+Optional OAuth 2.0 (client credentials, config-only; no users/DB):
+
+- Discovery (some clients probe multiple variants):
+  - `http://127.0.0.1:9000/.well-known/oauth-authorization-server`
+  - `http://127.0.0.1:9000/.well-known/oauth-authorization-server/mcp`
+  - `http://127.0.0.1:9000/mcp/.well-known/oauth-authorization-server`
+- Token endpoint: `http://127.0.0.1:9000/oauth/token`
+
+Enable in `~/.config/roamresearch-client-py/config.toml`:
+
+```toml
+[oauth]
+enabled = true
+require_auth = true
+allow_access_token_query = false
+signing_secret = "change-me-long-random"
+
+[[oauth.clients]]
+id = "local-dev"
+secret = "dev-secret"
+scopes = ["mcp"]
+```
+
+Notes:
+
+- Disable/skip OAuth: set `[oauth].enabled = false` (default). No `oauth.clients` needed.
+- `oauth.clients` is a static allowlist of OAuth2 `client_id`/`client_secret` pairs that can call `/oauth/token`.
+- Multiple clients are supported by adding multiple `[[oauth.clients]]` sections.
+
 ## SDK
 
 ### Connect

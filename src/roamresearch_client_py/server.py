@@ -1,4 +1,5 @@
 from typing import List, cast
+from dataclasses import dataclass
 import pprint
 from itertools import chain
 import logging
@@ -12,16 +13,23 @@ import sqlite3
 from datetime import datetime
 import json
 import re
+import base64
+import hmac
+import time
+from urllib.parse import parse_qs
 
 from dotenv import load_dotenv
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 import pendulum
 
 from .client import RoamClient, create_page, create_block
-from .config import get_env_or_config, get_config_dir
+from .config import get_env_or_config, get_config_dir, load_config
 from .formatter import format_block, format_block_as_markdown, extract_ref, expand_refs_in_text
 from .gfm_to_roam import gfm_to_batch_actions, gfm_to_blocks, normalize_task_marker
 from .diff import parse_existing_blocks, diff_block_trees, generate_batch_actions
@@ -60,6 +68,9 @@ logger = logging.getLogger(__name__)
 # Heuristic: when updating a single block, treat large/multiline content as
 # markdown that should be expanded into children blocks.
 BLOCK_UPDATE_MARKDOWN_NEWLINE_THRESHOLD = 5
+
+# OAuth / Auth (minimal, config-only; no DB/users)
+OAUTH_REQUIRED_SCOPE = "mcp"
 
 # Background task management
 background_tasks: set[asyncio.Task] = set()
@@ -289,6 +300,213 @@ def _split_root_and_children_markdown(markdown: str) -> tuple[str, int | None, s
 
     children_markdown = "\n".join(rest_lines).strip("\n")
     return (root_text, root_heading, children_markdown)
+
+
+def _parse_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+@dataclass(frozen=True)
+class OAuthClientConfig:
+    client_id: str
+    client_secret: str
+    scopes: list[str]
+
+
+@dataclass(frozen=True)
+class OAuthSettings:
+    enabled: bool
+    require_auth: bool
+    allow_access_token_query: bool
+    audience: str
+    signing_secret: str
+    access_token_ttl_seconds: int
+    scopes_supported: list[str]
+    clients_by_id: dict[str, OAuthClientConfig]
+
+
+def _load_oauth_settings() -> OAuthSettings:
+    enabled = _parse_bool(get_env_or_config("OAUTH_ENABLED", "oauth.enabled", False), False)
+    require_auth = _parse_bool(get_env_or_config("OAUTH_REQUIRE_AUTH", "oauth.require_auth", False), False)
+    allow_access_token_query = _parse_bool(
+        get_env_or_config("OAUTH_ALLOW_ACCESS_TOKEN_QUERY", "oauth.allow_access_token_query", False),
+        False,
+    )
+    audience = str(get_env_or_config("OAUTH_AUDIENCE", "oauth.audience", "roamresearch-mcp"))
+    signing_secret = str(get_env_or_config("OAUTH_SIGNING_SECRET", "oauth.signing_secret", "") or "")
+    access_token_ttl_seconds = int(get_env_or_config(
+        "OAUTH_ACCESS_TOKEN_TTL_SECONDS",
+        "oauth.access_token_ttl_seconds",
+        3600,
+    ))
+
+    cfg = load_config()
+    oauth_cfg = cfg.get("oauth", {}) if isinstance(cfg, dict) else {}
+    scopes_supported = oauth_cfg.get("scopes_supported") if isinstance(oauth_cfg, dict) else None
+    if not scopes_supported:
+        scopes_supported = [OAUTH_REQUIRED_SCOPE]
+
+    raw_clients = oauth_cfg.get("clients", []) if isinstance(oauth_cfg, dict) else []
+    clients_by_id: dict[str, OAuthClientConfig] = {}
+    if isinstance(raw_clients, list):
+        for item in raw_clients:
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("id") or "")
+            csecret = str(item.get("secret") or "")
+            scopes = item.get("scopes") or []
+            if not cid or not csecret:
+                continue
+            if not isinstance(scopes, list):
+                scopes = [str(scopes)]
+            scopes = [str(s).strip() for s in scopes if str(s).strip()]
+            if not scopes:
+                scopes = [OAUTH_REQUIRED_SCOPE]
+            clients_by_id[cid] = OAuthClientConfig(client_id=cid, client_secret=csecret, scopes=scopes)
+
+    if enabled and not signing_secret:
+        raise ValueError("oauth.enabled=true but oauth.signing_secret is missing")
+    if enabled and not clients_by_id:
+        raise ValueError("oauth.enabled=true but oauth.clients is empty (no client_id/secret configured)")
+
+    return OAuthSettings(
+        enabled=enabled,
+        require_auth=require_auth,
+        allow_access_token_query=allow_access_token_query,
+        audience=audience,
+        signing_secret=signing_secret,
+        access_token_ttl_seconds=access_token_ttl_seconds,
+        scopes_supported=list(scopes_supported),
+        clients_by_id=clients_by_id,
+    )
+
+
+def _request_issuer(request: Request) -> str:
+    """
+    Infer issuer from the incoming request.
+
+    Prefer Host header (user can control via nginx). Scheme defaults to request.url.scheme,
+    with optional support for X-Forwarded-Proto.
+    """
+    host = request.headers.get("host") or request.url.netloc
+    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+    return f"{scheme}://{host}"
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    padding = "=" * ((4 - (len(s) % 4)) % 4)
+    return base64.urlsafe_b64decode((s + padding).encode("ascii"))
+
+
+def _jwt_encode(payload: dict, secret: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    sig = hmac.new(secret.encode("utf-8"), signing_input, digestmod="sha256").digest()
+    sig_b64 = _b64url_encode(sig)
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
+
+
+def _jwt_decode(token: str, secret: str) -> dict:
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+    except ValueError:
+        raise ValueError("invalid_token: bad format")
+
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    expected_sig = hmac.new(secret.encode("utf-8"), signing_input, digestmod="sha256").digest()
+    actual_sig = _b64url_decode(sig_b64)
+    if not hmac.compare_digest(expected_sig, actual_sig):
+        raise ValueError("invalid_token: bad signature")
+
+    payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_token: bad payload")
+    return payload
+
+
+def _extract_bearer_token(request: Request, *, allow_query: bool) -> str | None:
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        return token or None
+    if allow_query:
+        token = request.query_params.get("access_token")
+        return token or None
+    return None
+
+
+def _unauthorized(detail: str = "Unauthorized") -> Response:
+    return PlainTextResponse(
+        detail,
+        status_code=401,
+        headers={"WWW-Authenticate": 'Bearer realm="mcp"'},
+    )
+
+
+class OAuthAuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, *, settings: OAuthSettings):
+        super().__init__(app)
+        self.settings = settings
+
+    async def dispatch(self, request: Request, call_next):
+        if not self.settings.enabled or not self.settings.require_auth:
+            return await call_next(request)
+
+        path = request.url.path
+        # Always allow oauth discovery + token endpoint without auth.
+        if path.startswith("/.well-known/oauth-authorization-server"):
+            return await call_next(request)
+        if path.startswith("/mcp/.well-known/oauth-authorization-server"):
+            return await call_next(request)
+        if path == "/oauth/token":
+            return await call_next(request)
+
+        protected = path == "/mcp" or path.startswith("/sse") or path.startswith("/messages")
+        if not protected:
+            return await call_next(request)
+
+        token = _extract_bearer_token(request, allow_query=self.settings.allow_access_token_query)
+        if not token:
+            return _unauthorized("Missing Bearer token")
+
+        try:
+            payload = _jwt_decode(token, self.settings.signing_secret)
+        except Exception as e:
+            return _unauthorized(str(e))
+
+        now = int(time.time())
+        exp = payload.get("exp")
+        if not isinstance(exp, int) or exp <= now:
+            return _unauthorized("invalid_token: expired")
+
+        if payload.get("aud") != self.settings.audience:
+            return _unauthorized("invalid_token: bad audience")
+
+        # issuer is request-derived (host-based) so tokens are bound to the served host.
+        if payload.get("iss") != _request_issuer(request):
+            return _unauthorized("invalid_token: bad issuer")
+
+        scope = payload.get("scope") or ""
+        scopes = set(str(scope).split())
+        if OAUTH_REQUIRED_SCOPE not in scopes:
+            return _unauthorized("insufficient_scope")
+
+        return await call_next(request)
 
 
 async def _process_content_blocks_background(task_id: str, page_uid: str, actions: list):
@@ -1149,6 +1367,124 @@ async def get_journaling_by_date(when=None):
 #
 
 
+def create_app():
+    app = mcp.streamable_http_app()
+    # FIXME: mount for SSE endpoint, but missed the authorization middleware.
+    app.routes.extend(mcp.sse_app().routes)
+
+    settings = _load_oauth_settings()
+    if settings.enabled:
+        app.add_middleware(OAuthAuthMiddleware, settings=settings)
+
+        def _oauth_metadata(request: Request) -> Response:
+            issuer = _request_issuer(request)
+            return JSONResponse(
+                {
+                    "issuer": issuer,
+                    "token_endpoint": f"{issuer}/oauth/token",
+                    "grant_types_supported": ["client_credentials"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+                    "scopes_supported": settings.scopes_supported,
+                }
+            )
+
+        async def _oauth_token(request: Request) -> Response:
+            # RFC 6749: x-www-form-urlencoded
+            params: dict[str, str] = {}
+            content_type = (request.headers.get("content-type") or "").lower()
+            raw = await request.body()
+            if "application/json" in content_type:
+                try:
+                    payload = json.loads(raw.decode("utf-8") or "{}")
+                except Exception:
+                    payload = {}
+                if isinstance(payload, dict):
+                    params = {str(k): str(v) for k, v in payload.items() if v is not None}
+            else:
+                parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+                params = {k: (v[-1] if v else "") for k, v in parsed.items()}
+
+            grant_type = (params.get("grant_type") or "").strip()
+            if grant_type != "client_credentials":
+                return JSONResponse(
+                    {"error": "unsupported_grant_type", "error_description": "Only client_credentials is supported"},
+                    status_code=400,
+                )
+
+            # Client authentication: Basic or client_secret_post
+            client_id = ""
+            client_secret = ""
+            auth = request.headers.get("authorization") or ""
+            if auth.lower().startswith("basic "):
+                try:
+                    decoded = base64.b64decode(auth.split(" ", 1)[1].strip()).decode("utf-8")
+                    client_id, client_secret = decoded.split(":", 1)
+                except Exception:
+                    return JSONResponse(
+                        {"error": "invalid_client", "error_description": "Bad basic auth"},
+                        status_code=401,
+                    )
+            else:
+                client_id = (params.get("client_id") or "").strip()
+                client_secret = (params.get("client_secret") or "").strip()
+
+            client = settings.clients_by_id.get(client_id)
+            if not client or not hmac.compare_digest(client.client_secret, client_secret):
+                return JSONResponse(
+                    {"error": "invalid_client", "error_description": "Unknown client or bad secret"},
+                    status_code=401,
+                )
+
+            requested_scope = (params.get("scope") or "").strip()
+            if requested_scope:
+                requested_scopes = [s for s in requested_scope.split() if s]
+                if any(s not in client.scopes for s in requested_scopes):
+                    return JSONResponse(
+                        {"error": "invalid_scope", "error_description": "Requested scope not allowed for client"},
+                        status_code=400,
+                    )
+                scope = " ".join(requested_scopes)
+            else:
+                # Default: grant all client scopes.
+                scope = " ".join(client.scopes)
+
+            issuer = _request_issuer(request)
+            now = int(time.time())
+            exp = now + max(1, int(settings.access_token_ttl_seconds))
+            token = _jwt_encode(
+                {
+                    "iss": issuer,
+                    "sub": client.client_id,
+                    "aud": settings.audience,
+                    "iat": now,
+                    "exp": exp,
+                    "scope": scope,
+                },
+                settings.signing_secret,
+            )
+
+            return JSONResponse(
+                {
+                    "access_token": token,
+                    "token_type": "Bearer",
+                    "expires_in": int(settings.access_token_ttl_seconds),
+                    "scope": scope,
+                }
+            )
+
+        # OAuth discovery endpoints (multiple variants for client probing)
+        for path in (
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/oauth-authorization-server/mcp",
+            "/mcp/.well-known/oauth-authorization-server",
+        ):
+            app.add_route(path, _oauth_metadata, methods=["GET"])
+
+        app.add_route("/oauth/token", _oauth_token, methods=["POST"])
+
+    return app
+
+
 async def serve(host: str | None = None, port: int | None = None):
     load_dotenv()
 
@@ -1158,9 +1494,7 @@ async def serve(host: str | None = None, port: int | None = None):
 
     import uvicorn
 
-    app = mcp.streamable_http_app()
-    # FIXME: mount for SSE endpoint, but missed the authorization middleware.
-    app.routes.extend(mcp.sse_app().routes)
+    app = create_app()
 
     config_host = get_env_or_config("HOST", "mcp.host")
     config_port = get_env_or_config("PORT", "mcp.port")

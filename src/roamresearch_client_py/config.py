@@ -70,6 +70,20 @@ def init_config_file() -> Path:
 [storage]
 # dir = ""  # Directory for debug files
 
+[oauth]
+# enabled = false
+# require_auth = false
+# allow_access_token_query = false  # allow ?access_token=... (useful for SSE clients)
+# audience = "roamresearch-mcp"
+# signing_secret = ""  # HS256 signing secret (required if enabled)
+# access_token_ttl_seconds = 3600
+# scopes_supported = ["mcp"]
+#
+# [[oauth.clients]]
+# id = "local-dev"
+# secret = "dev-secret"
+# scopes = ["mcp"]
+
 [batch]
 # size = 100
 # max_retries = 3
