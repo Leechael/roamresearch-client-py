@@ -641,18 +641,28 @@ class McpCorsMiddleware:
 
             async def send_with_cors(message):
                 if message["type"] == "http.response.start":
-                    headers = dict(message.get("headers", []))
+                    # Collect CORS header names we'll inject (lowercase bytes)
+                    cors_header_names = set()
+                    new_headers = []
                     allow_origin = cors_headers.get("Access-Control-Allow-Origin")
                     if allow_origin:
-                        headers[b"access-control-allow-origin"] = allow_origin.encode()
+                        cors_header_names.add(b"access-control-allow-origin")
+                        new_headers.append((b"access-control-allow-origin", allow_origin.encode()))
                     if "Access-Control-Allow-Credentials" in cors_headers:
-                        headers[b"access-control-allow-credentials"] = cors_headers["Access-Control-Allow-Credentials"].encode()
+                        cors_header_names.add(b"access-control-allow-credentials")
+                        new_headers.append((b"access-control-allow-credentials", cors_headers["Access-Control-Allow-Credentials"].encode()))
                     if "Vary" in cors_headers:
-                        headers[b"vary"] = cors_headers["Vary"].encode()
+                        cors_header_names.add(b"vary")
+                        new_headers.append((b"vary", cors_headers["Vary"].encode()))
+
+                    # Keep existing headers except those we're replacing
+                    existing = message.get("headers", [])
+                    filtered = [(k, v) for k, v in existing if k.lower() not in cors_header_names]
+
                     message = {
                         "type": message["type"],
                         "status": message["status"],
-                        "headers": list(headers.items()),
+                        "headers": filtered + new_headers,
                     }
                 await send(message)
 
