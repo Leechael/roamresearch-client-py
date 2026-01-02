@@ -6,21 +6,35 @@ from typing import Any
 import toml
 
 
-CONFIG_DIR = Path.home() / ".config" / "roamresearch-client-py"
-CONFIG_FILE = CONFIG_DIR / "config.toml"
+DEFAULT_CONFIG_DIR = Path.home() / ".config" / "roamresearch-client-py"
+
+
+def get_config_file() -> Path:
+    """
+    Return the active config file path.
+
+    Override with env var `ROAM_CONFIG_FILE` (useful for `pdm run start -- --config ...`).
+    """
+    override = os.getenv("ROAM_CONFIG_FILE")
+    if override:
+        return Path(override).expanduser()
+    return DEFAULT_CONFIG_DIR / "config.toml"
 
 
 def get_config_dir() -> Path:
     """Get the configuration directory, creating it if necessary."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    return CONFIG_DIR
+    config_file = get_config_file()
+    config_dir = config_file.parent
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir
 
 
 def load_config() -> dict[str, Any]:
     """Load configuration from the config file."""
-    if not CONFIG_FILE.exists():
+    config_file = get_config_file()
+    if not config_file.exists():
         return {}
-    return toml.load(CONFIG_FILE)
+    return toml.load(config_file)
 
 
 def get_config_value(key: str, default: Any = None) -> Any:
@@ -51,8 +65,9 @@ def get_env_or_config(env_key: str, config_key: str | None = None, default: Any 
 
 def init_config_file() -> Path:
     """Create a default config file if it doesn't exist."""
-    get_config_dir()
-    if not CONFIG_FILE.exists():
+    config_file = get_config_file()
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    if not config_file.exists():
         default_config = """\
 # Roam Research Client Configuration
 # https://github.com/user/roamresearch-client-py
@@ -66,9 +81,32 @@ def init_config_file() -> Path:
 # port = 9000
 # topic_node = ""
 # allowed_hosts = ""  # Comma-separated list of allowed hosts for remote MCP
+# cors_allow_origins = ""  # Comma-separated list; use "*" to allow any origin
+# cors_allow_origin_regex = ""  # Regex for allowed Origin
+# cors_auto_allow_origin_from_host = true  # Default true; allow Origin matching "{proto}://{Host}" (nginx-friendly)
+# cors_allow_headers = "authorization,content-type"
+# cors_allow_methods = "GET,POST,OPTIONS"
+# cors_allow_credentials = false
+# cors_max_age = 600
+# cors_allow_private_network = false
 
 [storage]
 # dir = ""  # Directory for debug files
+
+[oauth]
+# enabled = false
+# require_auth = false
+# allow_access_token_query = false  # allow ?access_token=... (useful for SSE clients)
+# audience = "roamresearch-mcp"
+# signing_secret = ""  # HS256 signing secret (required if enabled)
+# access_token_ttl_seconds = 3600
+# scopes_supported = ["mcp"]
+#
+# [[oauth.clients]]
+# id = "local-dev"
+# secret = "dev-secret"  # Optional for authorization_code+PKCE; required for client_credentials
+# scopes = ["mcp"]
+# redirect_uris = ["http://localhost:6274/oauth/callback"]  # For /authorize (authorization_code)
 
 [batch]
 # size = 100
@@ -78,9 +116,9 @@ def init_config_file() -> Path:
 # level = "WARNING"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 # httpx_level = "WARNING"  # Control httpx library logging separately
 """
-        with open(CONFIG_FILE, "w") as f:
+        with open(config_file, "w") as f:
             f.write(default_config)
-    return CONFIG_FILE
+    return config_file
 
 
 def configure_logging(

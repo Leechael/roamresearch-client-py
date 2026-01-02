@@ -102,6 +102,54 @@ rr mcp --port 9100
 rr mcp --token <T> --graph <G>
 ```
 
+Endpoints (default host `127.0.0.1`, port `9000`):
+
+- Streamable HTTP: `http://127.0.0.1:9000/mcp`
+- SSE:
+  - Event stream: `http://127.0.0.1:9000/sse`
+  - Client messages: `http://127.0.0.1:9000/messages`
+
+Optional OAuth 2.0 (config-only; no users/DB):
+
+- Protected Resource Metadata (RFC 9728):
+  - `http://127.0.0.1:9000/.well-known/oauth-protected-resource`
+  - `http://127.0.0.1:9000/.well-known/oauth-protected-resource/mcp`
+  - `http://127.0.0.1:9000/mcp/.well-known/oauth-protected-resource`
+- Authorization Server Metadata (RFC 8414):
+  - `http://127.0.0.1:9000/.well-known/oauth-authorization-server`
+  - `http://127.0.0.1:9000/.well-known/oauth-authorization-server/mcp`
+  - `http://127.0.0.1:9000/mcp/.well-known/oauth-authorization-server`
+- Token endpoint: `http://127.0.0.1:9000/oauth/token`
+- Authorization endpoint (for `authorization_code` + PKCE): `http://127.0.0.1:9000/authorize`
+
+Enable in `~/.config/roamresearch-client-py/config.toml`:
+
+```toml
+[oauth]
+enabled = true
+require_auth = true
+allow_access_token_query = false
+signing_secret = "change-me-long-random"
+
+[[oauth.clients]]
+id = "claude"
+secret = ""  # empty for public client (authorization_code + PKCE)
+scopes = ["mcp"]
+redirect_uris = ["https://claude.ai/api/mcp/auth_callback"]
+```
+
+Notes:
+
+- Disable/skip OAuth: set `[oauth].enabled = false` (default). No `oauth.clients` needed.
+- `oauth.clients` is a static allowlist of OAuth2 clients; `secret` is required for `client_credentials` and optional for `authorization_code` (PKCE public clients).
+- Multiple clients are supported by adding multiple `[[oauth.clients]]` sections.
+
+Browser CORS / preflight:
+
+- Some browser MCP clients will send `OPTIONS /sse` preflight requests. Configure allowed origins via:
+  - `mcp.cors_allow_origins` (comma-separated) or `mcp.cors_allow_origin_regex`
+  - `mcp.cors_auto_allow_origin_from_host = true` (default) allows same-origin requests based on the request `Host` (recommended when behind nginx that sets `Host`/`X-Forwarded-Proto`).
+
 ## SDK
 
 ### Connect

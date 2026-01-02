@@ -1,4 +1,6 @@
 from typing import List, cast
+from dataclasses import dataclass
+import argparse
 import pprint
 from itertools import chain
 import logging
@@ -11,18 +13,28 @@ import traceback
 import sqlite3
 from datetime import datetime
 import json
+import re
+import base64
+import hashlib
+import hmac
+import time
+from urllib.parse import parse_qs
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse, Response, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 import pendulum
 
 from .client import RoamClient, create_page, create_block
-from .config import get_env_or_config, get_config_dir
+from .config import get_env_or_config, get_config_dir, load_config
 from .formatter import format_block, format_block_as_markdown, extract_ref, expand_refs_in_text
-from .gfm_to_roam import gfm_to_batch_actions, gfm_to_blocks
+from .gfm_to_roam import gfm_to_batch_actions, gfm_to_blocks, normalize_task_marker
 from .diff import parse_existing_blocks, diff_block_trees, generate_batch_actions
 
 
@@ -55,6 +67,13 @@ def _get_transport_security() -> TransportSecuritySettings | None:
 
 mcp = FastMCP(name="RoamResearch", stateless_http=True, transport_security=_get_transport_security())
 logger = logging.getLogger(__name__)
+
+# Heuristic: when updating a single block, treat large/multiline content as
+# markdown that should be expanded into children blocks.
+BLOCK_UPDATE_MARKDOWN_NEWLINE_THRESHOLD = 5
+
+# OAuth / Auth (minimal, config-only; no DB/users)
+OAUTH_REQUIRED_SCOPE = "mcp"
 
 # Background task management
 background_tasks: set[asyncio.Task] = set()
@@ -231,6 +250,476 @@ def parse_uid(s: str) -> str | None:
     if len(s) <= 40 and all(c.isalnum() or c in '-_' for c in s):
         return s
     return None
+
+
+_MD_HEADING_RE = re.compile(r"^(#{1,6})(?:\s+(.*))?\s*$")
+
+
+def _should_parse_block_update_as_markdown(text: str) -> bool:
+    """
+    Heuristic: treat block updates as structured markdown when the payload is
+    clearly multi-line content or starts with a markdown heading.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.count("\n") > BLOCK_UPDATE_MARKDOWN_NEWLINE_THRESHOLD:
+        return True
+    return re.match(r"^#{1,6}\s", stripped) is not None
+
+
+def _split_root_and_children_markdown(markdown: str) -> tuple[str, int | None, str]:
+    """
+    Split markdown intended to update a single block into:
+      - root block text (string)
+      - root block heading (1..3) or None
+      - children markdown (remaining content)
+
+    Rule:
+      - If the first non-empty line is a markdown heading, use it for root text/heading.
+      - Otherwise, use that line as root text (no heading).
+      - The remaining lines (if any) are treated as markdown for children.
+    """
+    stripped = markdown.strip()
+    if not stripped:
+        return ("", None, "")
+
+    lines = stripped.splitlines()
+    first_idx = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first_idx is None:
+        return ("", None, "")
+
+    first_line = lines[first_idx].rstrip()
+    rest_lines = lines[first_idx + 1 :]
+
+    heading_match = _MD_HEADING_RE.match(first_line.strip())
+    if heading_match:
+        level = len(heading_match.group(1))
+        root_heading = min(level, 3)
+        root_text = (heading_match.group(2) or "").strip()
+    else:
+        root_heading = None
+        root_text = first_line.strip()
+
+    children_markdown = "\n".join(rest_lines).strip("\n")
+    return (root_text, root_heading, children_markdown)
+
+
+def _parse_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+@dataclass(frozen=True)
+class OAuthClientConfig:
+    client_id: str
+    client_secret: str | None
+    scopes: list[str]
+    redirect_uris: list[str]
+
+
+@dataclass(frozen=True)
+class OAuthSettings:
+    enabled: bool
+    require_auth: bool
+    allow_access_token_query: bool
+    allow_dynamic_registration: bool
+    audience: str
+    signing_secret: str
+    access_token_ttl_seconds: int
+    scopes_supported: list[str]
+    clients_by_id: dict[str, OAuthClientConfig]
+
+
+def _load_oauth_settings() -> OAuthSettings:
+    enabled = _parse_bool(get_env_or_config("OAUTH_ENABLED", "oauth.enabled", False), False)
+    require_auth = _parse_bool(get_env_or_config("OAUTH_REQUIRE_AUTH", "oauth.require_auth", False), False)
+    allow_access_token_query = _parse_bool(
+        get_env_or_config("OAUTH_ALLOW_ACCESS_TOKEN_QUERY", "oauth.allow_access_token_query", False),
+        False,
+    )
+    allow_dynamic_registration = _parse_bool(
+        get_env_or_config("OAUTH_ALLOW_DYNAMIC_REGISTRATION", "oauth.allow_dynamic_registration", True),
+        True,
+    )
+    audience = str(get_env_or_config("OAUTH_AUDIENCE", "oauth.audience", "roamresearch-mcp"))
+    signing_secret = str(get_env_or_config("OAUTH_SIGNING_SECRET", "oauth.signing_secret", "") or "")
+    access_token_ttl_seconds = int(get_env_or_config(
+        "OAUTH_ACCESS_TOKEN_TTL_SECONDS",
+        "oauth.access_token_ttl_seconds",
+        3600,
+    ))
+
+    cfg = load_config()
+    oauth_cfg = cfg.get("oauth", {}) if isinstance(cfg, dict) else {}
+    scopes_supported = oauth_cfg.get("scopes_supported") if isinstance(oauth_cfg, dict) else None
+    if not scopes_supported:
+        scopes_supported = [OAUTH_REQUIRED_SCOPE]
+
+    raw_clients = oauth_cfg.get("clients", []) if isinstance(oauth_cfg, dict) else []
+    clients_by_id: dict[str, OAuthClientConfig] = {}
+    if isinstance(raw_clients, list):
+        for item in raw_clients:
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("id") or "")
+            raw_secret = item.get("secret")
+            csecret = str(raw_secret) if raw_secret is not None and str(raw_secret) != "" else None
+            scopes = item.get("scopes") or []
+            redirect_uris = item.get("redirect_uris") or []
+            if not cid:
+                continue
+            if not isinstance(scopes, list):
+                scopes = [str(scopes)]
+            scopes = [str(s).strip() for s in scopes if str(s).strip()]
+            if not scopes:
+                scopes = [OAUTH_REQUIRED_SCOPE]
+            if not isinstance(redirect_uris, list):
+                redirect_uris = [str(redirect_uris)]
+            redirect_uris = [str(u).strip() for u in redirect_uris if str(u).strip()]
+            clients_by_id[cid] = OAuthClientConfig(
+                client_id=cid,
+                client_secret=csecret,
+                scopes=scopes,
+                redirect_uris=redirect_uris,
+            )
+
+    if enabled and not signing_secret:
+        raise ValueError("oauth.enabled=true but oauth.signing_secret is missing")
+    if enabled and not clients_by_id and not allow_dynamic_registration:
+        raise ValueError("oauth.enabled=true but oauth.clients is empty and dynamic registration is disabled")
+
+    return OAuthSettings(
+        enabled=enabled,
+        require_auth=require_auth,
+        allow_access_token_query=allow_access_token_query,
+        allow_dynamic_registration=allow_dynamic_registration,
+        audience=audience,
+        signing_secret=signing_secret,
+        access_token_ttl_seconds=access_token_ttl_seconds,
+        scopes_supported=list(scopes_supported),
+        clients_by_id=clients_by_id,
+    )
+
+
+def _request_issuer(request: Request) -> str:
+    """
+    Infer issuer from the incoming request.
+
+    Prefer Host header (user can control via nginx). Scheme defaults to request.url.scheme,
+    with optional support for X-Forwarded-Proto.
+    """
+    host = request.headers.get("host") or request.url.netloc
+    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+    return f"{scheme}://{host}"
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    padding = "=" * ((4 - (len(s) % 4)) % 4)
+    return base64.urlsafe_b64decode((s + padding).encode("ascii"))
+
+
+def _jwt_encode(payload: dict, secret: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    sig = hmac.new(secret.encode("utf-8"), signing_input, digestmod="sha256").digest()
+    sig_b64 = _b64url_encode(sig)
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
+
+
+def _jwt_decode(token: str, secret: str) -> dict:
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+    except ValueError:
+        raise ValueError("invalid_token: bad format")
+
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    expected_sig = hmac.new(secret.encode("utf-8"), signing_input, digestmod="sha256").digest()
+    actual_sig = _b64url_decode(sig_b64)
+    if not hmac.compare_digest(expected_sig, actual_sig):
+        raise ValueError("invalid_token: bad signature")
+
+    payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_token: bad payload")
+    return payload
+
+
+def _sha256_b64url(raw: str) -> str:
+    digest = hashlib.sha256(raw.encode("utf-8")).digest()
+    return _b64url_encode(digest)
+
+
+def _append_query(url: str, params: dict[str, str]) -> str:
+    parts = urlsplit(url)
+    existing = parse_qs(parts.query, keep_blank_values=True)
+    for k, v in params.items():
+        existing[k] = [v]
+    query = urlencode(existing, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+
+
+def _extract_bearer_token(request: Request, *, allow_query: bool) -> str | None:
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        return token or None
+    if allow_query:
+        token = request.query_params.get("access_token")
+        return token or None
+    return None
+
+
+def _unauthorized(detail: str = "Unauthorized", *, request: Request | None = None) -> Response:
+    """Return 401 response with WWW-Authenticate header per RFC 9728."""
+    if request is not None:
+        issuer = _request_issuer(request)
+        resource_metadata_url = f"{issuer}/.well-known/oauth-protected-resource"
+        www_auth = f'Bearer realm="{resource_metadata_url}"'
+    else:
+        www_auth = 'Bearer realm="mcp"'
+    logger.debug(f"OAuth 401: {detail} | WWW-Authenticate: {www_auth}")
+    return PlainTextResponse(
+        detail,
+        status_code=401,
+        headers={"WWW-Authenticate": www_auth},
+    )
+
+
+class OAuthAuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, *, settings: OAuthSettings):
+        super().__init__(app)
+        self.settings = settings
+
+    async def dispatch(self, request: Request, call_next):
+        if not self.settings.enabled or not self.settings.require_auth:
+            return await call_next(request)
+
+        # Always allow CORS preflight (handled elsewhere); browsers can't attach Authorization reliably.
+        if request.method.upper() == "OPTIONS":
+            return await call_next(request)
+
+        path = request.url.path
+        # Always allow OAuth discovery, protected resource metadata, and token endpoints without auth.
+        if path.startswith("/.well-known/oauth-"):
+            return await call_next(request)
+        if path.startswith("/mcp/.well-known/oauth-"):
+            return await call_next(request)
+        if path in ("/oauth/token", "/oauth/register"):
+            return await call_next(request)
+        if path in ("/authorize", "/oauth/authorize"):
+            return await call_next(request)
+
+        protected = path == "/mcp" or path.startswith("/sse") or path.startswith("/messages")
+        if not protected:
+            return await call_next(request)
+
+        token = _extract_bearer_token(request, allow_query=self.settings.allow_access_token_query)
+        if not token:
+            logger.info(f"OAuth: No token in request to {path}")
+            return _unauthorized("Missing Bearer token", request=request)
+
+        try:
+            payload = _jwt_decode(token, self.settings.signing_secret)
+        except Exception as e:
+            logger.warning(f"OAuth: Token decode failed for {path}: {e}")
+            return _unauthorized("invalid_token: malformed", request=request)
+
+        now = int(time.time())
+        exp = payload.get("exp")
+        if not isinstance(exp, int) or exp <= now:
+            logger.warning(f"OAuth: Token expired for {path}")
+            return _unauthorized("invalid_token: expired", request=request)
+
+        if payload.get("aud") != self.settings.audience:
+            logger.warning(f"OAuth: Bad audience for {path}: got {payload.get('aud')}, expected {self.settings.audience}")
+            return _unauthorized("invalid_token: bad audience", request=request)
+
+        # issuer is request-derived (host-based) so tokens are bound to the served host.
+        expected_issuer = _request_issuer(request)
+        if payload.get("iss") != expected_issuer:
+            logger.warning(f"OAuth: Bad issuer for {path}: got {payload.get('iss')}, expected {expected_issuer}")
+            return _unauthorized("invalid_token: bad issuer", request=request)
+
+        scope = payload.get("scope") or ""
+        scopes = set(str(scope).split())
+        if OAUTH_REQUIRED_SCOPE not in scopes:
+            logger.warning(f"OAuth: Insufficient scope for {path}: got {scopes}, need {OAUTH_REQUIRED_SCOPE}")
+            return _unauthorized("insufficient_scope", request=request)
+
+        return await call_next(request)
+
+
+class McpCorsMiddleware(BaseHTTPMiddleware):
+    """
+    Minimal CORS support for browser-based MCP clients.
+
+    We handle OPTIONS preflight explicitly for /mcp and the SSE transport endpoints
+    (/sse, /messages) because the underlying MCP routes may not register OPTIONS.
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.cors = _load_mcp_cors_settings()
+
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin")
+        is_options = request.method.upper() == "OPTIONS"
+
+        # Only treat as CORS preflight if browser sets these headers.
+        is_preflight = is_options and bool(request.headers.get("access-control-request-method"))
+
+        path = request.url.path
+        is_mcp_transport = path == "/mcp" or path == "/sse" or path == "/messages"
+
+        if is_preflight and is_mcp_transport:
+            headers = _cors_headers_for_request(request, cors=self.cors)
+            return Response(status_code=204, headers=headers)
+
+        response = await call_next(request)
+
+        # Add CORS headers to actual responses when Origin is present and allowed.
+        if origin:
+            headers = _cors_headers_for_request(request, cors=self.cors)
+            allow_origin = headers.get("Access-Control-Allow-Origin")
+            if allow_origin:
+                response.headers["Access-Control-Allow-Origin"] = allow_origin
+            if "Access-Control-Allow-Credentials" in headers:
+                response.headers["Access-Control-Allow-Credentials"] = headers["Access-Control-Allow-Credentials"]
+            if "Vary" in headers:
+                response.headers["Vary"] = headers["Vary"]
+
+        return response
+
+
+def _load_mcp_cors_settings() -> dict:
+    cfg = load_config()
+    mcp_cfg = cfg.get("mcp", {}) if isinstance(cfg, dict) else {}
+
+    allow_origins_raw = get_env_or_config("MCP_CORS_ALLOW_ORIGINS", "mcp.cors_allow_origins", "")
+    allow_origin_regex = get_env_or_config("MCP_CORS_ALLOW_ORIGIN_REGEX", "mcp.cors_allow_origin_regex", "")
+    allow_headers_raw = get_env_or_config(
+        "MCP_CORS_ALLOW_HEADERS",
+        "mcp.cors_allow_headers",
+        "authorization,content-type",
+    )
+    allow_methods_raw = get_env_or_config(
+        "MCP_CORS_ALLOW_METHODS",
+        "mcp.cors_allow_methods",
+        "GET,POST,OPTIONS",
+    )
+    allow_credentials = _parse_bool(get_env_or_config(
+        "MCP_CORS_ALLOW_CREDENTIALS",
+        "mcp.cors_allow_credentials",
+        False,
+    ), False)
+    auto_allow_origin_from_host = _parse_bool(get_env_or_config(
+        "MCP_CORS_AUTO_ALLOW_ORIGIN_FROM_HOST",
+        "mcp.cors_auto_allow_origin_from_host",
+        True,
+    ), False)
+    max_age = int(get_env_or_config("MCP_CORS_MAX_AGE", "mcp.cors_max_age", 600))
+    allow_private_network = _parse_bool(get_env_or_config(
+        "MCP_CORS_ALLOW_PRIVATE_NETWORK",
+        "mcp.cors_allow_private_network",
+        False,
+    ), False)
+
+    allow_origins: list[str] = []
+    if allow_origins_raw:
+        allow_origins = [o.strip() for o in str(allow_origins_raw).split(",") if o.strip()]
+
+    return {
+        "allow_origins": allow_origins,
+        "allow_origin_regex": str(allow_origin_regex or ""),
+        "allow_headers": [h.strip().lower() for h in str(allow_headers_raw).split(",") if h.strip()],
+        "allow_methods": [m.strip().upper() for m in str(allow_methods_raw).split(",") if m.strip()],
+        "allow_credentials": allow_credentials,
+        "auto_allow_origin_from_host": auto_allow_origin_from_host,
+        "max_age": max_age,
+        "allow_private_network": allow_private_network,
+    }
+
+
+def _cors_headers_for_request(request: Request, *, cors: dict) -> dict[str, str]:
+    """
+    Minimal CORS preflight support for browser-based MCP clients (SSE).
+    """
+    origin = request.headers.get("origin")
+    headers: dict[str, str] = {
+        "Access-Control-Allow-Methods": ", ".join(cors["allow_methods"]),
+        "Access-Control-Max-Age": str(cors["max_age"]),
+    }
+
+    requested_headers = request.headers.get("access-control-request-headers")
+    if requested_headers:
+        # Validate requested headers against configured allow_headers whitelist
+        allowed_headers_set = set(cors["allow_headers"])
+        requested_list = [h.strip().lower() for h in requested_headers.split(",") if h.strip()]
+        validated = [h for h in requested_list if h in allowed_headers_set]
+        headers["Access-Control-Allow-Headers"] = ", ".join(validated) if validated else ", ".join(cors["allow_headers"])
+    else:
+        headers["Access-Control-Allow-Headers"] = ", ".join(cors["allow_headers"])
+
+    if cors["allow_private_network"] and request.headers.get("access-control-request-private-network") == "true":
+        headers["Access-Control-Allow-Private-Network"] = "true"
+
+    if not origin:
+        return headers
+
+    allowed = False
+    allow_origins: list[str] = cors["allow_origins"]
+    allow_origin_regex: str = cors["allow_origin_regex"]
+    if "*" in allow_origins:
+        allowed = True
+    elif origin in allow_origins:
+        allowed = True
+    elif allow_origin_regex:
+        try:
+            if re.match(allow_origin_regex, origin):
+                allowed = True
+        except re.error:
+            # Bad regex config: treat as disallowed rather than failing requests.
+            allowed = False
+
+    # Optional: allow same-origin by comparing Origin against Host (as set by nginx)
+    # and inferred scheme (x-forwarded-proto preferred).
+    if not allowed and cors.get("auto_allow_origin_from_host"):
+        try:
+            host = request.headers.get("host") or request.url.netloc
+            scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+            expected_origin = f"{scheme}://{host}"
+            if origin == expected_origin:
+                allowed = True
+        except Exception:
+            allowed = False
+
+    if allowed:
+        # If credentials are allowed, we must echo origin (not "*").
+        if cors["allow_credentials"]:
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+            headers["Access-Control-Allow-Credentials"] = "true"
+        else:
+            headers["Access-Control-Allow-Origin"] = "*" if "*" in allow_origins else origin
+            if "*" not in allow_origins:
+                headers["Vary"] = "Origin"
+
+    return headers
 
 
 async def _process_content_blocks_background(task_id: str, page_uid: str, actions: list):
@@ -895,6 +1384,11 @@ Use when: editing pages, modifying content, revising notes.
 - dry_run: Preview changes only. Default: false.
 
 Returns change summary. Preserves block UIDs where possible.
+
+Note: when identifier is a block UID, multi-line markdown (or content starting
+with a markdown heading) is treated as structured content: the first line/heading
+updates the target block itself, and the remaining markdown is converted into
+children blocks.
 """
 )
 async def update_markdown(identifier: str, markdown: str, dry_run: bool = False) -> str:
@@ -902,11 +1396,74 @@ async def update_markdown(identifier: str, markdown: str, dry_run: bool = False)
 
     async with RoamClient() as client:
         if uid:
-            # Single block update - synchronous
-            result = await client.update_block_text(uid, markdown.strip(), dry_run=dry_run)
-            stats = result['stats']
+            text = markdown.strip()
+
+            if not _should_parse_block_update_as_markdown(text):
+                # Single block update (plain text)
+                result = await client.update_block_text(uid, normalize_task_marker(text), dry_run=dry_run)
+                stats = result["stats"]
+                prefix = "Dry run - would make" if dry_run else "Updated"
+                return f"{prefix}: {stats['updates']} updates"
+
+            # Structured update: first line/heading updates the block itself,
+            # remaining markdown becomes children.
+            existing_block = await client.get_block_by_uid(uid)
+            if not existing_block:
+                return f"Error: Block not found: {uid}"
+
+            root_text, root_heading, children_markdown = _split_root_and_children_markdown(text)
+            root_text = normalize_task_marker(root_text)
+
+            existing_text = existing_block.get(":block/string", "")
+            existing_heading = existing_block.get(":block/heading")
+
+            root_update_action: dict = {"action": "update-block", "block": {"uid": uid}}
+            needs_root_update = False
+
+            if root_text != existing_text:
+                root_update_action["block"]["string"] = root_text
+                needs_root_update = True
+
+            if root_heading is not None:
+                if root_heading != existing_heading:
+                    root_update_action["block"]["heading"] = root_heading
+                    needs_root_update = True
+            elif existing_heading is not None:
+                # Clear heading if the new root is not a heading.
+                root_update_action["block"]["heading"] = 0
+                needs_root_update = True
+
+            actions: list[dict] = []
+            updates_root = 0
+            if needs_root_update:
+                actions.append(root_update_action)
+                updates_root = 1
+
+            creates = moves = deletes = 0
+            updates_children = 0
+
+            if children_markdown.strip():
+                existing_children = parse_existing_blocks(existing_block)
+                new_children = gfm_to_blocks(children_markdown, uid, skip_h1=False)
+                diff = diff_block_trees(existing_children, new_children, uid)
+                actions.extend(generate_batch_actions(diff))
+                stats = diff.stats()
+                creates = stats["creates"]
+                updates_children = stats["updates"]
+                moves = stats["moves"]
+                deletes = stats["deletes"]
+
+            updates = updates_root + updates_children
             prefix = "Dry run - would make" if dry_run else "Updated"
-            return f"{prefix}: {stats['updates']} updates"
+
+            if dry_run:
+                return f"{prefix}: {creates} creates, {updates} updates, {moves} moves, {deletes} deletes"
+
+            if not actions:
+                return "No changes needed"
+
+            await client.batch_actions(actions)
+            return f"{prefix}: {creates} creates, {updates} updates, {moves} moves, {deletes} deletes"
 
         # Page update - compute diff first
         page = await client.get_page_by_title(identifier)
@@ -1023,6 +1580,458 @@ async def get_journaling_by_date(when=None):
 #
 
 
+def create_app():
+    app = mcp.streamable_http_app()
+    app.routes.extend(mcp.sse_app().routes)
+
+    settings = _load_oauth_settings()
+    if settings.enabled:
+        app.add_middleware(OAuthAuthMiddleware, settings=settings)
+
+        def _oauth_protected_resource_metadata(request: Request) -> Response:
+            """OAuth 2.0 Protected Resource Metadata (RFC 9728)."""
+            issuer = _request_issuer(request)
+            logger.debug(f"OAuth: Serving protected resource metadata for issuer={issuer}")
+            return JSONResponse({
+                "resource": issuer,
+                "authorization_servers": [issuer],
+                "scopes_supported": settings.scopes_supported,
+                "bearer_methods_supported": ["header"],
+            })
+
+        def _oauth_metadata(request: Request) -> Response:
+            issuer = _request_issuer(request)
+            metadata: dict = {
+                "issuer": issuer,
+                "authorization_endpoint": f"{issuer}/authorize",
+                "token_endpoint": f"{issuer}/oauth/token",
+                "grant_types_supported": ["client_credentials", "authorization_code"],
+                "response_types_supported": ["code"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": [
+                    "client_secret_basic",
+                    "client_secret_post",
+                    "none",
+                ],
+                "scopes_supported": settings.scopes_supported,
+            }
+            if settings.allow_dynamic_registration:
+                metadata["registration_endpoint"] = f"{issuer}/oauth/register"
+            return JSONResponse(metadata)
+
+        # NOTE: In-memory store for used authorization codes. This only works correctly
+        # in single-worker deployments. For multi-worker setups, a shared store (Redis,
+        # database) would be needed to prevent auth code replay across workers.
+        used_auth_codes: dict[str, int] = {}
+
+        # In-memory store for dynamically registered clients (RFC 7591).
+        # Same single-worker caveat as above.
+        dynamic_clients: dict[str, OAuthClientConfig] = {}
+
+        def _get_client(client_id: str) -> OAuthClientConfig | None:
+            """Look up client from static config or dynamic registration."""
+            return settings.clients_by_id.get(client_id) or dynamic_clients.get(client_id)
+
+        def _purge_used_codes(now: int):
+            # Keep dict small; auth codes are very short-lived.
+            expired = [k for k, exp in used_auth_codes.items() if exp <= now]
+            for k in expired:
+                used_auth_codes.pop(k, None)
+
+        def _mark_code_used(jti: str, exp: int, now: int) -> bool:
+            _purge_used_codes(now)
+            if jti in used_auth_codes:
+                return False
+            used_auth_codes[jti] = exp
+            return True
+
+        def _oauth_error_redirect(redirect_uri: str, *, error: str, desc: str | None, state: str | None) -> Response:
+            params = {"error": error}
+            if desc:
+                params["error_description"] = desc
+            if state:
+                params["state"] = state
+            return RedirectResponse(_append_query(redirect_uri, params), status_code=302)
+
+        async def _oauth_authorize(request: Request) -> Response:
+            qp = request.query_params
+            response_type = (qp.get("response_type") or "").strip()
+            client_id = (qp.get("client_id") or "").strip()
+            redirect_uri = (qp.get("redirect_uri") or "").strip()
+            state = (qp.get("state") or "").strip() or None
+            requested_scope = (qp.get("scope") or "").strip()
+            code_challenge = (qp.get("code_challenge") or "").strip()
+            code_challenge_method = (qp.get("code_challenge_method") or "").strip()
+
+            logger.info(f"OAuth /authorize: client_id={client_id}, response_type={response_type}, redirect_uri={redirect_uri}, scope={requested_scope}")
+
+            if response_type != "code":
+                logger.warning(f"OAuth /authorize: unsupported response_type={response_type}")
+                return PlainTextResponse("unsupported_response_type", status_code=400)
+            if not client_id:
+                logger.warning("OAuth /authorize: missing client_id")
+                return PlainTextResponse("invalid_request: missing client_id", status_code=400)
+            client = _get_client(client_id)
+            if not client:
+                logger.warning(f"OAuth /authorize: unknown client_id={client_id}")
+                return PlainTextResponse("unauthorized_client", status_code=400)
+            if not redirect_uri:
+                logger.warning("OAuth /authorize: missing redirect_uri")
+                return PlainTextResponse("invalid_request: missing redirect_uri", status_code=400)
+            if not client.redirect_uris or redirect_uri not in client.redirect_uris:
+                # If redirect is not allowed, don't redirect (avoid open redirect).
+                logger.warning(f"OAuth /authorize: redirect_uri not allowed: {redirect_uri}, allowed: {client.redirect_uris}")
+                return PlainTextResponse("invalid_request: redirect_uri not allowed", status_code=400)
+
+            if code_challenge_method != "S256" or not code_challenge:
+                return _oauth_error_redirect(
+                    redirect_uri,
+                    error="invalid_request",
+                    desc="PKCE S256 required (code_challenge + code_challenge_method=S256)",
+                    state=state,
+                )
+
+            if requested_scope:
+                requested_scopes = [s for s in requested_scope.split() if s]
+                if any(s not in client.scopes for s in requested_scopes):
+                    return _oauth_error_redirect(
+                        redirect_uri,
+                        error="invalid_scope",
+                        desc="Requested scope not allowed for client",
+                        state=state,
+                    )
+                scope = " ".join(requested_scopes)
+            else:
+                scope = " ".join(client.scopes)
+
+            issuer = _request_issuer(request)
+            now = int(time.time())
+            exp = now + 120
+            jti = uuid.uuid4().hex
+            code = _jwt_encode(
+                {
+                    "iss": issuer,
+                    "aud": "oauth-code",
+                    "iat": now,
+                    "exp": exp,
+                    "jti": jti,
+                    "client_id": client.client_id,
+                    "redirect_uri": redirect_uri,
+                    "scope": scope,
+                    "code_challenge": code_challenge,
+                    "code_challenge_method": "S256",
+                },
+                settings.signing_secret,
+            )
+
+            params = {"code": code}
+            if state:
+                params["state"] = state
+            logger.info(f"OAuth /authorize: issuing code for client_id={client_id}, scope={scope}, redirect_uri={redirect_uri}")
+            return RedirectResponse(_append_query(redirect_uri, params), status_code=302)
+
+        async def _oauth_token(request: Request) -> Response:
+            # RFC 6749: x-www-form-urlencoded
+            params: dict[str, str] = {}
+            content_type = (request.headers.get("content-type") or "").lower()
+            raw = await request.body()
+            if "application/json" in content_type:
+                try:
+                    payload = json.loads(raw.decode("utf-8") or "{}")
+                except Exception:
+                    payload = {}
+                if isinstance(payload, dict):
+                    params = {str(k): str(v) for k, v in payload.items() if v is not None}
+            else:
+                parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+                params = {k: (v[-1] if v else "") for k, v in parsed.items()}
+
+            grant_type = (params.get("grant_type") or "").strip()
+            logger.info(f"OAuth /token: grant_type={grant_type}, client_id={params.get('client_id', '(from auth header)')}")
+            if grant_type not in {"client_credentials", "authorization_code"}:
+                logger.warning(f"OAuth /token: unsupported grant_type={grant_type}")
+                return JSONResponse(
+                    {"error": "unsupported_grant_type", "error_description": "Supported: client_credentials, authorization_code"},
+                    status_code=400,
+                )
+
+            # Client authentication: Basic or client_secret_post or none (public client for auth code)
+            client_id = ""
+            client_secret: str | None = None
+            auth = request.headers.get("authorization") or ""
+            if auth.lower().startswith("basic "):
+                try:
+                    decoded = base64.b64decode(auth.split(" ", 1)[1].strip()).decode("utf-8")
+                    client_id, client_secret = decoded.split(":", 1)
+                except Exception:
+                    return JSONResponse(
+                        {"error": "invalid_client", "error_description": "Bad basic auth"},
+                        status_code=401,
+                    )
+            else:
+                client_id = (params.get("client_id") or "").strip()
+                raw_secret = (params.get("client_secret") or "").strip()
+                client_secret = raw_secret or None
+
+            client = _get_client(client_id)
+            if not client:
+                logger.warning(f"OAuth /token: unknown client_id={client_id}")
+                return JSONResponse(
+                    {"error": "invalid_client", "error_description": "Unknown client"},
+                    status_code=401,
+                )
+
+            if grant_type == "client_credentials":
+                if not client.client_secret:
+                    return JSONResponse(
+                        {"error": "invalid_client", "error_description": "Client has no secret; client_credentials not allowed"},
+                        status_code=401,
+                    )
+                if not client_secret or not hmac.compare_digest(client.client_secret, client_secret):
+                    return JSONResponse(
+                        {"error": "invalid_client", "error_description": "Bad secret"},
+                        status_code=401,
+                    )
+
+                requested_scope = (params.get("scope") or "").strip()
+                if requested_scope:
+                    requested_scopes = [s for s in requested_scope.split() if s]
+                    if any(s not in client.scopes for s in requested_scopes):
+                        return JSONResponse(
+                            {"error": "invalid_scope", "error_description": "Requested scope not allowed for client"},
+                            status_code=400,
+                        )
+                    scope = " ".join(requested_scopes)
+                else:
+                    scope = " ".join(client.scopes)
+
+            else:
+                # authorization_code + PKCE (S256)
+                code = (params.get("code") or "").strip()
+                redirect_uri = (params.get("redirect_uri") or "").strip()
+                code_verifier = (params.get("code_verifier") or "").strip()
+
+                if not code or not redirect_uri or not code_verifier:
+                    return JSONResponse(
+                        {"error": "invalid_request", "error_description": "Missing code, redirect_uri, or code_verifier"},
+                        status_code=400,
+                    )
+
+                # If the client has a secret configured, require it (confidential client).
+                if client.client_secret:
+                    if not client_secret or not hmac.compare_digest(client.client_secret, client_secret):
+                        return JSONResponse(
+                            {"error": "invalid_client", "error_description": "Bad secret"},
+                            status_code=401,
+                        )
+
+                try:
+                    code_payload = _jwt_decode(code, settings.signing_secret)
+                except Exception:
+                    return JSONResponse(
+                        {"error": "invalid_grant", "error_description": "Invalid code"},
+                        status_code=400,
+                    )
+
+                now = int(time.time())
+                if code_payload.get("aud") != "oauth-code":
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Bad code audience"}, status_code=400)
+                exp = code_payload.get("exp")
+                if not isinstance(exp, int) or exp <= now:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Code expired"}, status_code=400)
+
+                issuer = _request_issuer(request)
+                if code_payload.get("iss") != issuer:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Bad code issuer"}, status_code=400)
+
+                if code_payload.get("client_id") != client.client_id:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Code client mismatch"}, status_code=400)
+                if code_payload.get("redirect_uri") != redirect_uri:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
+
+                if code_payload.get("code_challenge_method") != "S256":
+                    return JSONResponse({"error": "invalid_grant", "error_description": "PKCE S256 required"}, status_code=400)
+                expected = code_payload.get("code_challenge") or ""
+                if not isinstance(expected, str) or not expected:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Missing code_challenge"}, status_code=400)
+                actual = _sha256_b64url(code_verifier)
+                if not hmac.compare_digest(expected, actual):
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Bad code_verifier"}, status_code=400)
+
+                jti = code_payload.get("jti") or ""
+                if not isinstance(jti, str) or not jti:
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Bad code jti"}, status_code=400)
+                if not _mark_code_used(jti, exp, now):
+                    return JSONResponse({"error": "invalid_grant", "error_description": "Code already used"}, status_code=400)
+
+                scope = str(code_payload.get("scope") or "").strip() or " ".join(client.scopes)
+
+            issuer = _request_issuer(request)
+            now = int(time.time())
+            exp = now + max(1, int(settings.access_token_ttl_seconds))
+            token = _jwt_encode(
+                {
+                    "iss": issuer,
+                    "sub": client.client_id,
+                    "aud": settings.audience,
+                    "iat": now,
+                    "exp": exp,
+                    "scope": scope,
+                },
+                settings.signing_secret,
+            )
+
+            logger.info(f"OAuth /token: issued access_token for client_id={client.client_id}, scope={scope}, expires_in={settings.access_token_ttl_seconds}s")
+            return JSONResponse(
+                {
+                    "access_token": token,
+                    "token_type": "Bearer",
+                    "expires_in": int(settings.access_token_ttl_seconds),
+                    "scope": scope,
+                }
+            )
+
+        async def _oauth_register(request: Request) -> Response:
+            """RFC 7591 Dynamic Client Registration endpoint."""
+            if not settings.allow_dynamic_registration:
+                return JSONResponse(
+                    {"error": "registration_not_supported", "error_description": "Dynamic client registration is disabled"},
+                    status_code=400,
+                )
+
+            content_type = (request.headers.get("content-type") or "").lower()
+            if "application/json" not in content_type:
+                return JSONResponse(
+                    {"error": "invalid_request", "error_description": "Content-Type must be application/json"},
+                    status_code=400,
+                )
+
+            try:
+                body = await request.body()
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except Exception:
+                return JSONResponse(
+                    {"error": "invalid_request", "error_description": "Invalid JSON body"},
+                    status_code=400,
+                )
+
+            if not isinstance(payload, dict):
+                return JSONResponse(
+                    {"error": "invalid_request", "error_description": "Request body must be a JSON object"},
+                    status_code=400,
+                )
+
+            # Extract client metadata
+            redirect_uris = payload.get("redirect_uris") or []
+            if not isinstance(redirect_uris, list):
+                redirect_uris = [str(redirect_uris)]
+            redirect_uris = [str(u).strip() for u in redirect_uris if str(u).strip()]
+
+            # Validate redirect_uris (required for authorization_code flow)
+            if not redirect_uris:
+                return JSONResponse(
+                    {"error": "invalid_redirect_uri", "error_description": "At least one redirect_uri is required"},
+                    status_code=400,
+                )
+
+            # Validate redirect_uri format (must be valid URLs)
+            for uri in redirect_uris:
+                if not uri.startswith(("http://", "https://")):
+                    return JSONResponse(
+                        {"error": "invalid_redirect_uri", "error_description": f"Invalid redirect_uri: {uri}"},
+                        status_code=400,
+                    )
+
+            client_name = payload.get("client_name") or ""
+            grant_types = payload.get("grant_types") or ["authorization_code"]
+            if not isinstance(grant_types, list):
+                grant_types = [str(grant_types)]
+
+            token_endpoint_auth_method = payload.get("token_endpoint_auth_method") or "none"
+
+            # Generate client credentials
+            client_id = uuid.uuid4().hex
+
+            # For public clients (typical for Claude Code), no secret is generated.
+            # For confidential clients, generate a secret.
+            client_secret: str | None = None
+            if token_endpoint_auth_method in ("client_secret_basic", "client_secret_post"):
+                client_secret = uuid.uuid4().hex + uuid.uuid4().hex
+
+            # Determine allowed scopes (default to all supported scopes)
+            requested_scope = payload.get("scope") or ""
+            if requested_scope:
+                scopes = [s.strip() for s in str(requested_scope).split() if s.strip()]
+                # Validate scopes against supported scopes
+                invalid = [s for s in scopes if s not in settings.scopes_supported]
+                if invalid:
+                    return JSONResponse(
+                        {"error": "invalid_client_metadata", "error_description": f"Unsupported scopes: {invalid}"},
+                        status_code=400,
+                    )
+            else:
+                scopes = list(settings.scopes_supported)
+
+            # Create and store the client
+            client_config = OAuthClientConfig(
+                client_id=client_id,
+                client_secret=client_secret,
+                scopes=scopes,
+                redirect_uris=redirect_uris,
+            )
+            dynamic_clients[client_id] = client_config
+
+            logger.info(f"OAuth /register: registered new client client_id={client_id}, redirect_uris={redirect_uris}, scopes={scopes}")
+
+            # Build response per RFC 7591
+            response_payload: dict = {
+                "client_id": client_id,
+                "client_id_issued_at": int(time.time()),
+                "redirect_uris": redirect_uris,
+                "grant_types": grant_types,
+                "token_endpoint_auth_method": token_endpoint_auth_method,
+                "scope": " ".join(scopes),
+            }
+            if client_name:
+                response_payload["client_name"] = client_name
+            if client_secret:
+                response_payload["client_secret"] = client_secret
+                # Secrets don't expire in this implementation
+                response_payload["client_secret_expires_at"] = 0
+
+            return JSONResponse(response_payload, status_code=201)
+
+        # OAuth 2.0 Protected Resource Metadata (RFC 9728)
+        # Clients discover authorization by fetching this endpoint
+        for path in (
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+            "/mcp/.well-known/oauth-protected-resource",
+        ):
+            app.add_route(path, _oauth_protected_resource_metadata, methods=["GET"])
+
+        # OAuth Authorization Server Metadata (RFC 8414)
+        for path in (
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/oauth-authorization-server/mcp",
+            "/mcp/.well-known/oauth-authorization-server",
+        ):
+            app.add_route(path, _oauth_metadata, methods=["GET"])
+
+        for path in ("/authorize", "/oauth/authorize"):
+            app.add_route(path, _oauth_authorize, methods=["GET"])
+
+        app.add_route("/oauth/token", _oauth_token, methods=["POST"])
+
+        if settings.allow_dynamic_registration:
+            app.add_route("/oauth/register", _oauth_register, methods=["POST"])
+
+    # Add CORS last so it can decorate even error responses from inner middleware.
+    app.add_middleware(McpCorsMiddleware)
+
+    return app
+
+
 async def serve(host: str | None = None, port: int | None = None):
     load_dotenv()
 
@@ -1032,9 +2041,7 @@ async def serve(host: str | None = None, port: int | None = None):
 
     import uvicorn
 
-    app = mcp.streamable_http_app()
-    # FIXME: mount for SSE endpoint, but missed the authorization middleware.
-    app.routes.extend(mcp.sse_app().routes)
+    app = create_app()
 
     config_host = get_env_or_config("HOST", "mcp.host")
     config_port = get_env_or_config("PORT", "mcp.port")
@@ -1091,4 +2098,16 @@ async def serve(host: str | None = None, port: int | None = None):
 
 
 if __name__ == "__main__":
-    asyncio.run(serve())
+    parser = argparse.ArgumentParser(prog="python -m roamresearch_client_py.server")
+    parser.add_argument("--host", help="Host to bind (overrides config/env)")
+    parser.add_argument("--port", type=int, help="Port to bind (overrides config/env)")
+    parser.add_argument(
+        "--config",
+        help="Path to config.toml (sets ROAM_CONFIG_FILE)",
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        os.environ["ROAM_CONFIG_FILE"] = args.config
+
+    asyncio.run(serve(host=args.host, port=args.port))
