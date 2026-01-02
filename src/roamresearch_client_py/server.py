@@ -1,4 +1,4 @@
-from typing import List, cast
+from typing import Any, List, cast
 from dataclasses import dataclass
 import argparse
 import pprint
