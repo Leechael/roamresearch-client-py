@@ -121,17 +121,37 @@ async def test_middleware_allows_valid_bearer_token():
         settings.signing_secret,
     )
 
-    req = _request_for_middleware(headers=[(b"authorization", f"Bearer {token}".encode("ascii"))], path="/mcp")
-    middleware = server.OAuthAuthMiddleware(lambda scope, receive, send: None, settings=settings)
-
     called = {"ok": False}
+    response_started = {}
 
-    async def call_next(_request):
+    async def inner_app(scope, receive, send):
         called["ok"] = True
-        return server.PlainTextResponse("ok")
+        response = server.PlainTextResponse("ok")
+        await response(scope, receive, send)
 
-    resp = await middleware.dispatch(req, call_next)
-    assert resp.status_code == 200
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            response_started["status"] = message["status"]
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "headers": [(b"host", b"example.com"), (b"authorization", f"Bearer {token}".encode("ascii"))],
+        "client": ("testclient", 12345),
+        "server": ("example.com", 80),
+    }
+
+    middleware = server.OAuthAuthMiddleware(inner_app, settings=settings)
+    await middleware(scope, receive, send)
+
+    assert response_started["status"] == 200
     assert called["ok"] is True
 
 
@@ -152,28 +172,71 @@ async def test_middleware_allows_access_token_query_when_enabled():
         settings.signing_secret,
     )
 
-    req = _request_for_middleware(path="/mcp", query_string=f"access_token={token}".encode("ascii"))
-    middleware = server.OAuthAuthMiddleware(lambda scope, receive, send: None, settings=settings)
+    response_started = {}
 
-    async def call_next(_request):
-        return server.PlainTextResponse("ok")
+    async def inner_app(scope, receive, send):
+        response = server.PlainTextResponse("ok")
+        await response(scope, receive, send)
 
-    resp = await middleware.dispatch(req, call_next)
-    assert resp.status_code == 200
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            response_started["status"] = message["status"]
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": f"access_token={token}".encode("ascii"),
+        "headers": [(b"host", b"example.com")],
+        "client": ("testclient", 12345),
+        "server": ("example.com", 80),
+    }
+
+    middleware = server.OAuthAuthMiddleware(inner_app, settings=settings)
+    await middleware(scope, receive, send)
+
+    assert response_started["status"] == 200
 
 
 @pytest.mark.anyio
 async def test_middleware_does_not_require_token_when_require_auth_false():
     settings = _settings_for_middleware_tests()
     settings = server.OAuthSettings(**{**settings.__dict__, "require_auth": False})
-    req = _request_for_middleware(path="/mcp")
-    middleware = server.OAuthAuthMiddleware(lambda scope, receive, send: None, settings=settings)
 
-    async def call_next(_request):
-        return server.PlainTextResponse("ok")
+    response_started = {}
 
-    resp = await middleware.dispatch(req, call_next)
-    assert resp.status_code == 200
+    async def inner_app(scope, receive, send):
+        response = server.PlainTextResponse("ok")
+        await response(scope, receive, send)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            response_started["status"] = message["status"]
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "headers": [(b"host", b"example.com")],
+        "client": ("testclient", 12345),
+        "server": ("example.com", 80),
+    }
+
+    middleware = server.OAuthAuthMiddleware(inner_app, settings=settings)
+    await middleware(scope, receive, send)
+
+    assert response_started["status"] == 200
 
 
 @pytest.mark.anyio
@@ -183,19 +246,41 @@ async def test_middleware_returns_generic_error_for_malformed_token():
 
     # Token with invalid base64 in payload
     malformed_token = "eyJhbGciOiJIUzI1NiJ9.!!!invalid-base64!!!.sig"
-    req = _request_for_middleware(
-        headers=[(b"authorization", f"Bearer {malformed_token}".encode("ascii"))],
-        path="/mcp",
-    )
-    middleware = server.OAuthAuthMiddleware(lambda scope, receive, send: None, settings=settings)
 
-    async def call_next(_request):
-        return server.PlainTextResponse("ok")
+    response_started = {}
+    response_body = []
 
-    resp = await middleware.dispatch(req, call_next)
-    assert resp.status_code == 401
+    async def inner_app(scope, receive, send):
+        response = server.PlainTextResponse("ok")
+        await response(scope, receive, send)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            response_started["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            response_body.append(message.get("body", b""))
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "headers": [(b"host", b"example.com"), (b"authorization", f"Bearer {malformed_token}".encode("ascii"))],
+        "client": ("testclient", 12345),
+        "server": ("example.com", 80),
+    }
+
+    middleware = server.OAuthAuthMiddleware(inner_app, settings=settings)
+    await middleware(scope, receive, send)
+
+    assert response_started["status"] == 401
     # Should return generic message, not leak binascii.Error or JSONDecodeError details
-    body = resp.body.decode("utf-8")
+    body = b"".join(response_body).decode("utf-8")
     assert "invalid_token: malformed" in body
     assert "binascii" not in body.lower()
     assert "json" not in body.lower()
