@@ -27,7 +27,6 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response, RedirectResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 import pendulum
 
@@ -500,44 +499,69 @@ def _unauthorized(detail: str = "Unauthorized", *, request: Request | None = Non
     )
 
 
-class OAuthAuthMiddleware(BaseHTTPMiddleware):
+class OAuthAuthMiddleware:
+    """
+    OAuth authentication middleware for MCP endpoints.
+
+    NOTE: This is a pure ASGI middleware (not BaseHTTPMiddleware) to ensure
+    compatibility with SSE streaming responses. BaseHTTPMiddleware buffers
+    responses and breaks streaming.
+    """
+
     def __init__(self, app, *, settings: OAuthSettings):
-        super().__init__(app)
+        self.app = app
         self.settings = settings
 
-    async def dispatch(self, request: Request, call_next):
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive, send)
+
         if not self.settings.enabled or not self.settings.require_auth:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         # Always allow CORS preflight (handled elsewhere); browsers can't attach Authorization reliably.
         if request.method.upper() == "OPTIONS":
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         path = request.url.path
         # Always allow OAuth discovery, protected resource metadata, and token endpoints without auth.
         if path.startswith("/.well-known/oauth-"):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
         if path.startswith("/mcp/.well-known/oauth-"):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
         if path in ("/oauth/token", "/oauth/register"):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
         if path in ("/authorize", "/oauth/authorize"):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         protected = path == "/mcp" or path.startswith("/sse") or path.startswith("/messages")
         if not protected:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         token = _extract_bearer_token(request, allow_query=self.settings.allow_access_token_query)
         if not token:
             logger.info(f"OAuth: No token in request to {path}")
-            return _unauthorized("Missing Bearer token", request=request)
+            response = _unauthorized("Missing Bearer token", request=request)
+            await response(scope, receive, send)
+            return
 
         try:
             payload = _jwt_decode(token, self.settings.signing_secret)
         except Exception as e:
             logger.warning(f"OAuth: Token decode failed for {path}: {e}")
-            return _unauthorized("invalid_token: malformed", request=request)
+            response = _unauthorized("invalid_token: malformed", request=request)
+            await response(scope, receive, send)
+            return
 
         now = int(time.time())
         exp = payload.get("exp")
@@ -545,40 +569,57 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
         if exp is not None:
             if not isinstance(exp, int) or exp <= now:
                 logger.warning(f"OAuth: Token expired for {path}")
-                return _unauthorized("invalid_token: expired", request=request)
+                response = _unauthorized("invalid_token: expired", request=request)
+                await response(scope, receive, send)
+                return
 
         if payload.get("aud") != self.settings.audience:
             logger.warning(f"OAuth: Bad audience for {path}: got {payload.get('aud')}, expected {self.settings.audience}")
-            return _unauthorized("invalid_token: bad audience", request=request)
+            response = _unauthorized("invalid_token: bad audience", request=request)
+            await response(scope, receive, send)
+            return
 
         # issuer is request-derived (host-based) so tokens are bound to the served host.
         expected_issuer = _request_issuer(request)
         if payload.get("iss") != expected_issuer:
             logger.warning(f"OAuth: Bad issuer for {path}: got {payload.get('iss')}, expected {expected_issuer}")
-            return _unauthorized("invalid_token: bad issuer", request=request)
+            response = _unauthorized("invalid_token: bad issuer", request=request)
+            await response(scope, receive, send)
+            return
 
-        scope = payload.get("scope") or ""
-        scopes = set(str(scope).split())
+        scope_claim = payload.get("scope") or ""
+        scopes = set(str(scope_claim).split())
         if OAUTH_REQUIRED_SCOPE not in scopes:
             logger.warning(f"OAuth: Insufficient scope for {path}: got {scopes}, need {OAUTH_REQUIRED_SCOPE}")
-            return _unauthorized("insufficient_scope", request=request)
+            response = _unauthorized("insufficient_scope", request=request)
+            await response(scope, receive, send)
+            return
 
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 
-class McpCorsMiddleware(BaseHTTPMiddleware):
+class McpCorsMiddleware:
     """
     Minimal CORS support for browser-based MCP clients.
 
     We handle OPTIONS preflight explicitly for /mcp and the SSE transport endpoints
     (/sse, /messages) because the underlying MCP routes may not register OPTIONS.
+
+    NOTE: This is a pure ASGI middleware (not BaseHTTPMiddleware) to ensure
+    compatibility with SSE streaming responses. BaseHTTPMiddleware buffers
+    responses and breaks streaming.
     """
 
     def __init__(self, app):
-        super().__init__(app)
+        self.app = app
         self.cors = _load_mcp_cors_settings()
 
-    async def dispatch(self, request: Request, call_next):
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive, send)
         origin = request.headers.get("origin")
         is_options = request.method.upper() == "OPTIONS"
 
@@ -590,22 +631,34 @@ class McpCorsMiddleware(BaseHTTPMiddleware):
 
         if is_preflight and is_mcp_transport:
             headers = _cors_headers_for_request(request, cors=self.cors)
-            return Response(status_code=204, headers=headers)
+            response = Response(status_code=204, headers=headers)
+            await response(scope, receive, send)
+            return
 
-        response = await call_next(request)
-
-        # Add CORS headers to actual responses when Origin is present and allowed.
+        # For non-preflight requests, wrap send to inject CORS headers
         if origin:
-            headers = _cors_headers_for_request(request, cors=self.cors)
-            allow_origin = headers.get("Access-Control-Allow-Origin")
-            if allow_origin:
-                response.headers["Access-Control-Allow-Origin"] = allow_origin
-            if "Access-Control-Allow-Credentials" in headers:
-                response.headers["Access-Control-Allow-Credentials"] = headers["Access-Control-Allow-Credentials"]
-            if "Vary" in headers:
-                response.headers["Vary"] = headers["Vary"]
+            cors_headers = _cors_headers_for_request(request, cors=self.cors)
 
-        return response
+            async def send_with_cors(message):
+                if message["type"] == "http.response.start":
+                    headers = dict(message.get("headers", []))
+                    allow_origin = cors_headers.get("Access-Control-Allow-Origin")
+                    if allow_origin:
+                        headers[b"access-control-allow-origin"] = allow_origin.encode()
+                    if "Access-Control-Allow-Credentials" in cors_headers:
+                        headers[b"access-control-allow-credentials"] = cors_headers["Access-Control-Allow-Credentials"].encode()
+                    if "Vary" in cors_headers:
+                        headers[b"vary"] = cors_headers["Vary"].encode()
+                    message = {
+                        "type": message["type"],
+                        "status": message["status"],
+                        "headers": list(headers.items()),
+                    }
+                await send(message)
+
+            await self.app(scope, receive, send_with_cors)
+        else:
+            await self.app(scope, receive, send)
 
 
 def _load_mcp_cors_settings() -> dict:
@@ -965,7 +1018,15 @@ async def get_or_create_topic_uid(client, topic: str, when: pendulum.DateTime) -
 Use when: saving notes, creating pages, storing content to the graph.
 
 - title: Page title (plain text)
-- markdown: Content in GFM. Omit title as H1.
+- markdown: Content in GFM (GitHub Flavored Markdown). Omit title as H1.
+
+GFM format requirements:
+- Tables: Use pipe syntax with header separator row. NO indentation.
+  | Col1 | Col2 |
+  |------|------|
+  | A    | B    |
+- Lists: Use consistent markers (-, *, 1.). Indent children with 2 spaces.
+- Code blocks: Use triple backticks with language identifier.
 
 Returns task ID and page link. Auto-links to today's Daily Notes.
 """
@@ -1382,8 +1443,16 @@ async def handle_search_todos(
 Use when: editing pages, modifying content, revising notes.
 
 - identifier: Page title or block UID
-- markdown: New content in GFM
+- markdown: New content in GFM (GitHub Flavored Markdown)
 - dry_run: Preview changes only. Default: false.
+
+GFM format requirements:
+- Tables: Use pipe syntax with header separator row. NO indentation.
+  | Col1 | Col2 |
+  |------|------|
+  | A    | B    |
+- Lists: Use consistent markers (-, *, 1.). Indent children with 2 spaces.
+- Code blocks: Use triple backticks with language identifier.
 
 Returns change summary. Preserves block UIDs where possible.
 
