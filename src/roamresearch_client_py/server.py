@@ -355,7 +355,7 @@ def _load_oauth_settings() -> OAuthSettings:
     access_token_ttl_seconds = int(get_env_or_config(
         "OAUTH_ACCESS_TOKEN_TTL_SECONDS",
         "oauth.access_token_ttl_seconds",
-        3600,
+        -1,  # -1 means never expires
     ))
 
     cfg = load_config()
@@ -541,9 +541,11 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
 
         now = int(time.time())
         exp = payload.get("exp")
-        if not isinstance(exp, int) or exp <= now:
-            logger.warning(f"OAuth: Token expired for {path}")
-            return _unauthorized("invalid_token: expired", request=request)
+        # exp is optional: if present, must be valid future timestamp; if absent, token never expires
+        if exp is not None:
+            if not isinstance(exp, int) or exp <= now:
+                logger.warning(f"OAuth: Token expired for {path}")
+                return _unauthorized("invalid_token: expired", request=request)
 
         if payload.get("aud") != self.settings.audience:
             logger.warning(f"OAuth: Bad audience for {path}: got {payload.get('aud')}, expected {self.settings.audience}")
@@ -1868,28 +1870,29 @@ def create_app():
 
             issuer = _request_issuer(request)
             now = int(time.time())
-            exp = now + max(1, int(settings.access_token_ttl_seconds))
-            token = _jwt_encode(
-                {
-                    "iss": issuer,
-                    "sub": client.client_id,
-                    "aud": settings.audience,
-                    "iat": now,
-                    "exp": exp,
-                    "scope": scope,
-                },
-                settings.signing_secret,
-            )
+            ttl = int(settings.access_token_ttl_seconds)
+            claims: dict[str, Any] = {
+                "iss": issuer,
+                "sub": client.client_id,
+                "aud": settings.audience,
+                "iat": now,
+                "scope": scope,
+            }
+            # -1 means never expires; otherwise set exp claim
+            if ttl >= 0:
+                claims["exp"] = now + max(1, ttl)
+            token = _jwt_encode(claims, settings.signing_secret)
 
-            logger.info(f"OAuth /token: issued access_token for client_id={client.client_id}, scope={scope}, expires_in={settings.access_token_ttl_seconds}s")
-            return JSONResponse(
-                {
-                    "access_token": token,
-                    "token_type": "Bearer",
-                    "expires_in": int(settings.access_token_ttl_seconds),
-                    "scope": scope,
-                }
-            )
+            expires_log = "never" if ttl < 0 else f"{max(1, ttl)}s"
+            logger.info(f"OAuth /token: issued access_token for client_id={client.client_id}, scope={scope}, expires_in={expires_log}")
+            response_body: dict[str, Any] = {
+                "access_token": token,
+                "token_type": "Bearer",
+                "scope": scope,
+            }
+            if ttl >= 0:
+                response_body["expires_in"] = max(1, ttl)
+            return JSONResponse(response_body)
 
         async def _oauth_register(request: Request) -> Response:
             """RFC 7591 Dynamic Client Registration endpoint."""

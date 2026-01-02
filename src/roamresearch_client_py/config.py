@@ -99,7 +99,7 @@ def init_config_file() -> Path:
 # allow_access_token_query = false  # allow ?access_token=... (useful for SSE clients)
 # audience = "roamresearch-mcp"
 # signing_secret = ""  # HS256 signing secret (required if enabled)
-# access_token_ttl_seconds = 3600
+# access_token_ttl_seconds = -1  # -1 means never expires
 # scopes_supported = ["mcp"]
 #
 # [[oauth.clients]]
