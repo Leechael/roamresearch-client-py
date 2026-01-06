@@ -1,4 +1,4 @@
-from typing import List, cast
+from typing import Any, List, cast
 from dataclasses import dataclass
 import argparse
 import pprint
@@ -27,7 +27,6 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response, RedirectResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 import pendulum
 
@@ -355,7 +354,7 @@ def _load_oauth_settings() -> OAuthSettings:
     access_token_ttl_seconds = int(get_env_or_config(
         "OAUTH_ACCESS_TOKEN_TTL_SECONDS",
         "oauth.access_token_ttl_seconds",
-        3600,
+        -1,  # -1 means never expires
     ))
 
     cfg = load_config()
@@ -500,83 +499,129 @@ def _unauthorized(detail: str = "Unauthorized", *, request: Request | None = Non
     )
 
 
-class OAuthAuthMiddleware(BaseHTTPMiddleware):
+class OAuthAuthMiddleware:
+    """
+    OAuth authentication middleware for MCP endpoints.
+
+    NOTE: This is a pure ASGI middleware (not BaseHTTPMiddleware) to ensure
+    compatibility with SSE streaming responses. BaseHTTPMiddleware buffers
+    responses and breaks streaming.
+    """
+
     def __init__(self, app, *, settings: OAuthSettings):
-        super().__init__(app)
+        self.app = app
         self.settings = settings
 
-    async def dispatch(self, request: Request, call_next):
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive, send)
+
         if not self.settings.enabled or not self.settings.require_auth:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         # Always allow CORS preflight (handled elsewhere); browsers can't attach Authorization reliably.
         if request.method.upper() == "OPTIONS":
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         path = request.url.path
         # Always allow OAuth discovery, protected resource metadata, and token endpoints without auth.
         if path.startswith("/.well-known/oauth-"):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
         if path.startswith("/mcp/.well-known/oauth-"):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
         if path in ("/oauth/token", "/oauth/register"):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
         if path in ("/authorize", "/oauth/authorize"):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         protected = path == "/mcp" or path.startswith("/sse") or path.startswith("/messages")
         if not protected:
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         token = _extract_bearer_token(request, allow_query=self.settings.allow_access_token_query)
         if not token:
             logger.info(f"OAuth: No token in request to {path}")
-            return _unauthorized("Missing Bearer token", request=request)
+            response = _unauthorized("Missing Bearer token", request=request)
+            await response(scope, receive, send)
+            return
 
         try:
             payload = _jwt_decode(token, self.settings.signing_secret)
         except Exception as e:
             logger.warning(f"OAuth: Token decode failed for {path}: {e}")
-            return _unauthorized("invalid_token: malformed", request=request)
+            response = _unauthorized("invalid_token: malformed", request=request)
+            await response(scope, receive, send)
+            return
 
         now = int(time.time())
         exp = payload.get("exp")
-        if not isinstance(exp, int) or exp <= now:
-            logger.warning(f"OAuth: Token expired for {path}")
-            return _unauthorized("invalid_token: expired", request=request)
+        iat = payload.get("iat")
+        logger.debug(f"OAuth: Token validation for {path}: exp={exp}, iat={iat}, now={now}, has_exp={exp is not None}")
+        # exp is optional: if present, must be valid future timestamp; if absent, token never expires
+        if exp is not None:
+            if not isinstance(exp, int) or exp <= now:
+                logger.warning(f"OAuth: Token expired for {path}: exp={exp}, now={now}, diff={now - exp if isinstance(exp, int) else 'N/A'}s ago")
+                response = _unauthorized("invalid_token: expired", request=request)
+                await response(scope, receive, send)
+                return
 
         if payload.get("aud") != self.settings.audience:
             logger.warning(f"OAuth: Bad audience for {path}: got {payload.get('aud')}, expected {self.settings.audience}")
-            return _unauthorized("invalid_token: bad audience", request=request)
+            response = _unauthorized("invalid_token: bad audience", request=request)
+            await response(scope, receive, send)
+            return
 
         # issuer is request-derived (host-based) so tokens are bound to the served host.
         expected_issuer = _request_issuer(request)
         if payload.get("iss") != expected_issuer:
             logger.warning(f"OAuth: Bad issuer for {path}: got {payload.get('iss')}, expected {expected_issuer}")
-            return _unauthorized("invalid_token: bad issuer", request=request)
+            response = _unauthorized("invalid_token: bad issuer", request=request)
+            await response(scope, receive, send)
+            return
 
-        scope = payload.get("scope") or ""
-        scopes = set(str(scope).split())
+        scope_claim = payload.get("scope") or ""
+        scopes = set(str(scope_claim).split())
         if OAUTH_REQUIRED_SCOPE not in scopes:
             logger.warning(f"OAuth: Insufficient scope for {path}: got {scopes}, need {OAUTH_REQUIRED_SCOPE}")
-            return _unauthorized("insufficient_scope", request=request)
+            response = _unauthorized("insufficient_scope", request=request)
+            await response(scope, receive, send)
+            return
 
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 
-class McpCorsMiddleware(BaseHTTPMiddleware):
+class McpCorsMiddleware:
     """
     Minimal CORS support for browser-based MCP clients.
 
     We handle OPTIONS preflight explicitly for /mcp and the SSE transport endpoints
     (/sse, /messages) because the underlying MCP routes may not register OPTIONS.
+
+    NOTE: This is a pure ASGI middleware (not BaseHTTPMiddleware) to ensure
+    compatibility with SSE streaming responses. BaseHTTPMiddleware buffers
+    responses and breaks streaming.
     """
 
     def __init__(self, app):
-        super().__init__(app)
+        self.app = app
         self.cors = _load_mcp_cors_settings()
 
-    async def dispatch(self, request: Request, call_next):
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive, send)
         origin = request.headers.get("origin")
         is_options = request.method.upper() == "OPTIONS"
 
@@ -588,22 +633,44 @@ class McpCorsMiddleware(BaseHTTPMiddleware):
 
         if is_preflight and is_mcp_transport:
             headers = _cors_headers_for_request(request, cors=self.cors)
-            return Response(status_code=204, headers=headers)
+            response = Response(status_code=204, headers=headers)
+            await response(scope, receive, send)
+            return
 
-        response = await call_next(request)
-
-        # Add CORS headers to actual responses when Origin is present and allowed.
+        # For non-preflight requests, wrap send to inject CORS headers
         if origin:
-            headers = _cors_headers_for_request(request, cors=self.cors)
-            allow_origin = headers.get("Access-Control-Allow-Origin")
-            if allow_origin:
-                response.headers["Access-Control-Allow-Origin"] = allow_origin
-            if "Access-Control-Allow-Credentials" in headers:
-                response.headers["Access-Control-Allow-Credentials"] = headers["Access-Control-Allow-Credentials"]
-            if "Vary" in headers:
-                response.headers["Vary"] = headers["Vary"]
+            cors_headers = _cors_headers_for_request(request, cors=self.cors)
 
-        return response
+            async def send_with_cors(message):
+                if message["type"] == "http.response.start":
+                    # Collect CORS header names we'll inject (lowercase bytes)
+                    cors_header_names = set()
+                    new_headers = []
+                    allow_origin = cors_headers.get("Access-Control-Allow-Origin")
+                    if allow_origin:
+                        cors_header_names.add(b"access-control-allow-origin")
+                        new_headers.append((b"access-control-allow-origin", allow_origin.encode()))
+                    if "Access-Control-Allow-Credentials" in cors_headers:
+                        cors_header_names.add(b"access-control-allow-credentials")
+                        new_headers.append((b"access-control-allow-credentials", cors_headers["Access-Control-Allow-Credentials"].encode()))
+                    if "Vary" in cors_headers:
+                        cors_header_names.add(b"vary")
+                        new_headers.append((b"vary", cors_headers["Vary"].encode()))
+
+                    # Keep existing headers except those we're replacing
+                    existing = message.get("headers", [])
+                    filtered = [(k, v) for k, v in existing if k.lower() not in cors_header_names]
+
+                    message = {
+                        "type": message["type"],
+                        "status": message["status"],
+                        "headers": filtered + new_headers,
+                    }
+                await send(message)
+
+            await self.app(scope, receive, send_with_cors)
+        else:
+            await self.app(scope, receive, send)
 
 
 def _load_mcp_cors_settings() -> dict:
@@ -963,7 +1030,15 @@ async def get_or_create_topic_uid(client, topic: str, when: pendulum.DateTime) -
 Use when: saving notes, creating pages, storing content to the graph.
 
 - title: Page title (plain text)
-- markdown: Content in GFM. Omit title as H1.
+- markdown: Content in GFM (GitHub Flavored Markdown). Omit title as H1.
+
+GFM format requirements:
+- Tables: Use pipe syntax with header separator row. NO indentation.
+  | Col1 | Col2 |
+  |------|------|
+  | A    | B    |
+- Lists: Use consistent markers (-, *, 1.). Indent children with 2 spaces.
+- Code blocks: Use triple backticks with language identifier.
 
 Returns task ID and page link. Auto-links to today's Daily Notes.
 """
@@ -1380,8 +1455,16 @@ async def handle_search_todos(
 Use when: editing pages, modifying content, revising notes.
 
 - identifier: Page title or block UID
-- markdown: New content in GFM
+- markdown: New content in GFM (GitHub Flavored Markdown)
 - dry_run: Preview changes only. Default: false.
+
+GFM format requirements:
+- Tables: Use pipe syntax with header separator row. NO indentation.
+  | Col1 | Col2 |
+  |------|------|
+  | A    | B    |
+- Lists: Use consistent markers (-, *, 1.). Indent children with 2 spaces.
+- Code blocks: Use triple backticks with language identifier.
 
 Returns change summary. Preserves block UIDs where possible.
 
@@ -1868,28 +1951,35 @@ def create_app():
 
             issuer = _request_issuer(request)
             now = int(time.time())
-            exp = now + max(1, int(settings.access_token_ttl_seconds))
-            token = _jwt_encode(
-                {
-                    "iss": issuer,
-                    "sub": client.client_id,
-                    "aud": settings.audience,
-                    "iat": now,
-                    "exp": exp,
-                    "scope": scope,
-                },
-                settings.signing_secret,
-            )
+            ttl = int(settings.access_token_ttl_seconds)
+            logger.info(f"OAuth /token: ttl from settings = {ttl} (raw: {settings.access_token_ttl_seconds})")
+            claims: dict[str, Any] = {
+                "iss": issuer,
+                "sub": client.client_id,
+                "aud": settings.audience,
+                "iat": now,
+                "scope": scope,
+            }
+            # -1 means never expires; otherwise set exp claim
+            if ttl >= 0:
+                claims["exp"] = now + max(1, ttl)
+            token = _jwt_encode(claims, settings.signing_secret)
 
-            logger.info(f"OAuth /token: issued access_token for client_id={client.client_id}, scope={scope}, expires_in={settings.access_token_ttl_seconds}s")
-            return JSONResponse(
-                {
-                    "access_token": token,
-                    "token_type": "Bearer",
-                    "expires_in": int(settings.access_token_ttl_seconds),
-                    "scope": scope,
-                }
-            )
+            # Log actual values: token has no exp claim when ttl<0, but response includes large expires_in
+            expires_in_response = 315360000 if ttl < 0 else max(1, ttl)
+            logger.info(f"OAuth /token: issued access_token for client_id={client.client_id}, scope={scope}, token_has_exp={'exp' in claims}, response_expires_in={expires_in_response}s")
+            response_body: dict[str, Any] = {
+                "access_token": token,
+                "token_type": "Bearer",
+                "scope": scope,
+            }
+            if ttl >= 0:
+                response_body["expires_in"] = max(1, ttl)
+            else:
+                # Some OAuth clients assume a default expiry (e.g., 3600s) if expires_in is missing.
+                # Return a very large value (10 years) to prevent premature token refresh.
+                response_body["expires_in"] = 315360000
+            return JSONResponse(response_body)
 
         async def _oauth_register(request: Request) -> Response:
             """RFC 7591 Dynamic Client Registration endpoint."""
@@ -2049,11 +2139,16 @@ async def serve(host: str | None = None, port: int | None = None):
     default_port = 9000
     port = port or (int(config_port) if config_port else default_port)
 
+    log_config = uvicorn.config.LOGGING_CONFIG
+    log_config["formatters"]["access"]["fmt"] = "%(asctime)s - %(levelname)s - %(client_addr)s - \"%(request_line)s\" %(status_code)s"
+    log_config["formatters"]["default"]["fmt"] = "%(asctime)s - %(levelname)s - %(message)s"
+
     config = uvicorn.Config(
         app,
         host=host,
         port=port,
         log_level=mcp.settings.log_level.lower(),
+        log_config=log_config,
     )
     server = uvicorn.Server(config)
 
