@@ -565,10 +565,12 @@ class OAuthAuthMiddleware:
 
         now = int(time.time())
         exp = payload.get("exp")
+        iat = payload.get("iat")
+        logger.debug(f"OAuth: Token validation for {path}: exp={exp}, iat={iat}, now={now}, has_exp={exp is not None}")
         # exp is optional: if present, must be valid future timestamp; if absent, token never expires
         if exp is not None:
             if not isinstance(exp, int) or exp <= now:
-                logger.warning(f"OAuth: Token expired for {path}")
+                logger.warning(f"OAuth: Token expired for {path}: exp={exp}, now={now}, diff={now - exp if isinstance(exp, int) else 'N/A'}s ago")
                 response = _unauthorized("invalid_token: expired", request=request)
                 await response(scope, receive, send)
                 return
@@ -1950,6 +1952,7 @@ def create_app():
             issuer = _request_issuer(request)
             now = int(time.time())
             ttl = int(settings.access_token_ttl_seconds)
+            logger.info(f"OAuth /token: ttl from settings = {ttl} (raw: {settings.access_token_ttl_seconds})")
             claims: dict[str, Any] = {
                 "iss": issuer,
                 "sub": client.client_id,
@@ -1962,8 +1965,9 @@ def create_app():
                 claims["exp"] = now + max(1, ttl)
             token = _jwt_encode(claims, settings.signing_secret)
 
-            expires_log = "never" if ttl < 0 else f"{max(1, ttl)}s"
-            logger.info(f"OAuth /token: issued access_token for client_id={client.client_id}, scope={scope}, expires_in={expires_log}")
+            # Log actual values: token has no exp claim when ttl<0, but response includes large expires_in
+            expires_in_response = 315360000 if ttl < 0 else max(1, ttl)
+            logger.info(f"OAuth /token: issued access_token for client_id={client.client_id}, scope={scope}, token_has_exp={'exp' in claims}, response_expires_in={expires_in_response}s")
             response_body: dict[str, Any] = {
                 "access_token": token,
                 "token_type": "Bearer",
@@ -1971,6 +1975,10 @@ def create_app():
             }
             if ttl >= 0:
                 response_body["expires_in"] = max(1, ttl)
+            else:
+                # Some OAuth clients assume a default expiry (e.g., 3600s) if expires_in is missing.
+                # Return a very large value (10 years) to prevent premature token refresh.
+                response_body["expires_in"] = 315360000
             return JSONResponse(response_body)
 
         async def _oauth_register(request: Request) -> Response:
@@ -2131,11 +2139,16 @@ async def serve(host: str | None = None, port: int | None = None):
     default_port = 9000
     port = port or (int(config_port) if config_port else default_port)
 
+    log_config = uvicorn.config.LOGGING_CONFIG
+    log_config["formatters"]["access"]["fmt"] = "%(asctime)s - %(levelname)s - %(client_addr)s - \"%(request_line)s\" %(status_code)s"
+    log_config["formatters"]["default"]["fmt"] = "%(asctime)s - %(levelname)s - %(message)s"
+
     config = uvicorn.Config(
         app,
         host=host,
         port=port,
         log_level=mcp.settings.log_level.lower(),
+        log_config=log_config,
     )
     server = uvicorn.Server(config)
 
