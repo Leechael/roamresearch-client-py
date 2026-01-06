@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1 - 2026-01-06
+
+- chore(release): v0.3.5
+- feat: improve OAuth logging and return large expires_in for never-expiring tokens
+- ci: fix broken tests
+- fix: responses that legitimately need duplicate header names
+- fix: convert middlewares to pure ASGI for SSE compatibility
+- fix: typing
+- feat: support never-expiring OAuth access tokens with ttl=-1
+
 ## 0.3.5 - 2026-01-06
 
 - feat: improve OAuth logging and return large expires_in for never-expiring tokens
